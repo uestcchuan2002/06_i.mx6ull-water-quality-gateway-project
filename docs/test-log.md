@@ -1,3 +1,11 @@
+<!--
+ * @Author: uestcchuan2002 1992735052@qq.com
+ * @Date: 2026-06-22 21:23:43
+ * @LastEditors: uestcchuan2002 1992735052@qq.com
+ * @LastEditTime: 2026-06-22 21:23:44
+ * @FilePath: /03_water_quality_gateway_project/docs/test-log.md
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+-->
 # 项目调试记录
 
 
@@ -74,4 +82,4 @@ ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa root@192.16
 
 ### 4. 今日结论
 
-开发板已能通过串口终端正常输出 U-Boot 和 Linux 启动信息，并成功进入 Linux root shell。系统根文件系统挂载在 `/dev/mmcblk1p2`，类型为 ext3，串口控制台为 `ttymxc0,115200`。今日阶段目标中的“确认开发板能启动 Linux”和“确认串口终端可用”已完成。
+开发板已能通过串口终端正常输出 U-Boot 和 Linux 启动信息，并成功进入 Linux root shell。系统根文件系统挂载在 `/dev/mmcblk1p2`，类型为 ext3，串口控制台为 `ttymxc0,115200`。
