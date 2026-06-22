@@ -2,7 +2,7 @@
  * @Author: uestcchuan2002 1992735052@qq.com
  * @Date: 2026-06-22 21:23:43
  * @LastEditors: uestcchuan2002 1992735052@qq.com
- * @LastEditTime: 2026-06-22 21:23:44
+ * @LastEditTime: 2026-06-22 21:47:07
  * @FilePath: /03_water_quality_gateway_project/docs/test-log.md
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 -->
@@ -80,6 +80,34 @@ ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa root@192.16
 
 波特率:115200
 
-### 4. 今日结论
 
-开发板已能通过串口终端正常输出 U-Boot 和 Linux 启动信息，并成功进入 Linux root shell。系统根文件系统挂载在 `/dev/mmcblk1p2`，类型为 ext3，串口控制台为 `ttymxc0,115200`。
+
+## 2026-06-22 最小 Demo 运行记录
+
+### 编译方式
+
+在 Ubuntu 主机上使用 ARM 交叉编译器进行静态编译：
+
+```sh
+arm-linux-gnueabihf-gcc -Wall -Wextra -O2 -static main.c -o water_gateway
+```
+
+### 上传方式
+
+通过 `scp` 上传到开发板：
+
+```sh
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa water_gateway root@192.168.2.201:/home/root/water_gateway
+```
+
+### 运行结果
+
+在 i.MX6ULL 开发板上执行：
+```sh
+./water_gateway
+```
+输出:
+```sh
+water_gateway start
+sim sample: ph=7.12 temp=25.34 turbidity=3.20 conductivity=820
+```
