@@ -13,7 +13,7 @@ CC := $(CROSS_COMPILE)gcc
 
 CPPFLAGS += -I$(INC_DIR)
 CFLAGS += -std=gnu99 -Wall -Wextra -O2 -g -MMD -MP
-LDFLAGS +=
+LDFLAGS += -static
 
 .PHONY: all clean run
 

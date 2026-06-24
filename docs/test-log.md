@@ -269,3 +269,238 @@ gateway.conf -> config_load -> logger_init -> sample_generate_mock -> log_info
 - 支持设置波特率、8N1、读超时
 - 封装 `serial_read` 和 `serial_write`
 - 为后续 Modbus RTU 主站模块做准备
+
+## 2026-06-24 开发板运行、RTC 和串口模块初验
+
+### 1. 当日目标
+
+在 2026-06-23 应用层最小 Demo 的基础上，完成以下验证：
+
+- 将新版 `water_gateway` 交叉编译并上传到 i.MX6ULL 开发板
+- 使用 `-c gateway.conf` 参数解决配置文件路径问题
+- 修复开发板重启后系统时间错误的问题
+- 完成 `serial_port.h` 和 `serial_port.c`
+- 在开发板上验证串口设备 `/dev/ttymxc2` 可被程序打开
+
+### 2. 配置文件路径问题验证
+
+开发板运行命令：
+
+```sh
+./water_gateway -c gateway.conf
+```
+
+关键输出：
+
+```text
+[2026-06-24 20:01:04] [INFO] water gateway start
+[2026-06-24 20:01:04] [INFO] config_path=gateway.conf
+[2026-06-24 20:01:04] [INFO] config loaded
+[2026-06-24 20:01:04] [INFO] device_id=water_gateway_001
+[2026-06-24 20:01:04] [INFO] sample_period_ms=1000
+[2026-06-24 20:01:04] [INFO] serial_device=/dev/ttymxc2
+[2026-06-24 20:01:04] [INFO] baudrate=9600
+```
+
+结论：
+
+- `-c gateway.conf` 参数生效
+- 程序已能在开发板当前目录读取配置文件
+- 之前出现的 `open config file failed: No such file or directory` 问题已解决
+
+### 3. 开发板 RTC 时间修复
+
+问题现象：
+
+```text
+使用 date -s 修改系统时间后，重启开发板时间又恢复错误。
+```
+
+原因分析：
+
+```text
+date -s 只修改 Linux 当前系统时间，没有同步到 RTC 硬件时钟。
+```
+
+处理命令：
+
+```sh
+date -s "2026-06-24 20:00:00"
+hwclock -w
+reboot
+date
+```
+
+验证结果：
+
+```text
+开发板重启后系统时间保持正常。
+```
+
+结论：
+
+- 当前开发板存在 RTC 设备
+- 系统时间已成功写入 RTC
+- 后续日志时间可正常用于调试记录
+
+### 4. 串口设备确认
+
+执行命令：
+
+```sh
+ls /dev/
+```
+
+观察到的串口相关设备：
+
+```text
+/dev/ttymxc0
+/dev/ttymxc2
+```
+
+说明：
+
+- `/dev/ttymxc0` 大概率为调试控制台串口，不建议作为应用程序测试串口
+- `/dev/ttymxc2` 可作为当前阶段串口模块测试设备
+- 当前未观察到 `/dev/ttyUSB0`，说明 USB-RS485 暂未接入或未识别
+
+### 5. 新增串口模块
+
+新增文件：
+
+```text
+app/include/serial_port.h
+app/src/serial_port.c
+```
+
+当前接口：
+
+```c
+int serial_open(const char *device, int baudrate);
+int serial_close(int fd);
+int serial_write(int fd, const unsigned char *buf, int len);
+int serial_read(int fd, unsigned char *buf, int len, int timeout_ms);
+```
+
+已实现功能：
+
+- 打开串口设备
+- 支持 `9600`、`19200`、`38400`、`57600`、`115200`
+- 配置 8N1
+- 关闭校验位
+- 关闭硬件流控
+- 设置 raw mode
+- 使用 `select()` 支持超时读取
+- 封装循环写入
+
+### 6. 交叉编译问题记录
+
+#### 问题 1：glibc 版本不匹配
+
+现象：
+
+```text
+./water_gateway: /lib/libc.so.6: version `GLIBC_2.28' not found
+./water_gateway: /lib/libc.so.6: version `GLIBC_2.34' not found
+```
+
+原因：
+
+```text
+交叉编译工具链使用的 glibc 版本高于开发板 rootfs 中的 glibc 版本。
+```
+
+处理方式：
+
+```sh
+make clean
+make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+```
+
+#### 问题 2：Exec format error
+
+现象：
+
+```text
+-sh: ./water_gateway: cannot execute binary file: Exec format error
+```
+
+原因：
+
+```text
+上传的可执行文件不是开发板可执行的 ARM 32-bit ELF，可能是 PC 本地 gcc 编译产物或旧文件。
+```
+
+处理方式：
+
+```sh
+make clean
+make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+file water_gateway
+```
+
+正确文件类型应包含：
+
+```text
+ELF 32-bit LSB executable, ARM
+statically linked
+```
+
+### 7. 串口打开验证
+
+配置文件中串口相关配置：
+
+```ini
+serial_device=/dev/ttymxc2
+baudrate=9600
+```
+
+开发板运行命令：
+
+```sh
+./water_gateway -c gateway.conf
+```
+
+关键输出：
+
+```text
+[2026-06-24 20:01:04] [INFO] serial_device=/dev/ttymxc2
+[2026-06-24 20:01:04] [INFO] baudrate=9600
+[2026-06-24 20:01:09] [INFO] serial open success: /dev/ttymxc2
+```
+
+结论：
+
+- `serial_port` 模块在 i.MX6ULL 上编译和运行通过
+- 程序可成功打开 `/dev/ttymxc2`
+- 串口基础 open/config/close 流程验证通过
+- 项目已从纯模拟数据推进到真实 Linux 串口设备接口层
+
+### 8. 当日验收结论
+
+2026-06-24 的任务完成。
+
+已完成内容：
+
+- 最小 Demo 在 i.MX6ULL 上运行正常
+- 配置路径问题已解决
+- RTC 时间保持问题已解决
+- `serial_port` 模块第一版完成
+- `/dev/ttymxc2` 串口打开验证通过
+
+当前阶段闭环：
+
+```text
+gateway.conf -> config_load -> logger_init -> sample_generate_mock -> serial_open(/dev/ttymxc2)
+```
+
+### 9. 下一步计划
+
+下一阶段进入 Modbus RTU 主站基础模块：
+
+- 编写 `modbus_rtu.h`
+- 编写 `modbus_rtu.c`
+- 实现 CRC16
+- 构造 0x03 读保持寄存器请求帧
+- 解析响应帧
+- 通过串口模块发送和接收 Modbus RTU 数据帧

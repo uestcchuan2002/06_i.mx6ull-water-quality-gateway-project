@@ -18,6 +18,10 @@
 - 2026-06-23：完成 `logger.c/logger.h`，支持带时间戳的日志输出
 - 2026-06-23：完成 `sample.c/sample.h`，支持模拟水质数据生成与格式化输出
 - 2026-06-23：完成主程序周期采样测试，可按 `sample_period_ms` 输出模拟水质数据
+- 2026-06-24：完成 i.MX6ULL 开发板最小 Demo 运行验证
+- 2026-06-24：完成开发板系统时间和 RTC 写入验证，重启后时间保持正常
+- 2026-06-24：完成 `serial_port.c/serial_port.h`，支持 Linux 串口 open/config/read/write/close
+- 2026-06-24：完成 `/dev/ttymxc2` 串口打开测试，`serial open success` 验证通过
 
 ## 当前最小 Demo 功能
 
@@ -38,11 +42,13 @@
       config.h
       logger.h
       sample.h
+      serial_port.h
     src/
       main.c
       config.c
       logger.c
       sample.c
+      serial_port.c
   config/
     gateway.conf
   docs/
@@ -59,14 +65,14 @@
 cd app
 make clean
 make
-./water_gateway
+./water_gateway -c ../config/gateway.conf
 ```
 
 如果当前环境没有 `make`，可以临时使用 `gcc` 直接验证：
 
 ```sh
 gcc -std=gnu99 -Iinclude src/main.c src/config.c src/logger.c src/sample.c -o water_gateway_test
-./water_gateway_test
+./water_gateway_test -c ../config/gateway.conf
 ```
 
 ## 配置文件
@@ -87,11 +93,36 @@ serial_device=/dev/ttyUSB0
 baudrate=9600
 ```
 
+## 2026-06-24 开发板验证结果
+
+开发板运行命令：
+
+```sh
+./water_gateway -c gateway.conf
+```
+
+关键输出：
+
+```text
+[2026-06-24 20:01:04] [INFO] config loaded
+[2026-06-24 20:01:04] [INFO] serial_device=/dev/ttymxc2
+[2026-06-24 20:01:04] [INFO] baudrate=9600
+[2026-06-24 20:01:09] [INFO] serial open success: /dev/ttymxc2
+```
+
+结论：
+
+- 最小 Demo 已能在 i.MX6ULL 上读取配置并周期性输出模拟水质数据
+- 开发板时间已通过 `date -s` 和 `hwclock -w` 同步到 RTC，重启后时间保持正常
+- `serial_port` 模块已能打开 `/dev/ttymxc2`，串口基础 open/config/close 流程验证通过
+
 ## 下一步计划
 
-下一阶段开始实现串口模块：
+下一阶段开始实现 Modbus RTU 主站基础模块：
 
-- 编写 `serial_port.h`
-- 编写 `serial_port.c`
-- 封装串口打开、波特率设置、8N1 配置、读写接口和超时处理
-- 为后续 Modbus RTU 主站模块做准备
+- 编写 `modbus_rtu.h`
+- 编写 `modbus_rtu.c`
+- 实现 Modbus CRC16 校验
+- 构造 0x03 读保持寄存器请求帧
+- 解析 Modbus RTU 响应帧
+- 将串口模块和 Modbus 模块串联，为后续 RS485 真实采集做准备
