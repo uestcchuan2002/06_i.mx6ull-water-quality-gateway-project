@@ -504,3 +504,165 @@ gateway.conf -> config_load -> logger_init -> sample_generate_mock -> serial_ope
 - 构造 0x03 读保持寄存器请求帧
 - 解析响应帧
 - 通过串口模块发送和接收 Modbus RTU 数据帧
+
+## 2026-06-25 Modbus RTU 模块开发
+
+### 1. 当日目标
+
+完成 Modbus RTU 主站基础模块：
+
+- 编写 `modbus_rtu.h`
+- 编写 `modbus_rtu.c`
+- 实现 Modbus CRC16 校验
+- 构造 0x03 读保持寄存器请求帧
+- 解析 Modbus RTU 响应帧（含异常码分类）
+- 在主程序中添加 Modbus 功能测试
+
+### 2. 新增和修改文件
+
+```text
+app/include/modbus_rtu.h   (新增)
+app/src/modbus_rtu.c       (新增)
+app/src/main.c             (修改：添加 Modbus 测试代码)
+```
+
+### 3. 模块接口
+
+`modbus_rtu.h` 定义：
+
+```c
+unsigned short modbus_crc16(const unsigned char *buf, int len);
+int modbus_build_read_request(unsigned char slave_addr,
+                              unsigned short start_addr,
+                              unsigned short quantity,
+                              unsigned char *buf, int buf_size);
+int modbus_parse_response(const unsigned char *buf, int len,
+                          unsigned short *values, int max_values);
+void modbus_hex_dump(const unsigned char *buf, int len,
+                     char *out, int out_size);
+```
+
+已实现功能：
+
+- CRC16（多项式 0xA001，初值 0xFFFF）
+- 请求帧构造（从机地址 + 0x03 + 起始地址 + 寄存器数量 + CRC）
+- 响应帧解析（异常响应检测、CRC 校验、大端解包）
+- 十六进制 dump（调试用）
+
+### 4. Modbus 传感器回复测试案例
+
+2026-06-25 新增 `modbus_run_sensor_tests()`，覆盖 8 个测试案例：
+
+| # | 测试场景 | 关键数据 | 预期结果 |
+|---|---------|---------|---------|
+| 1 | 正常数据 | pH=712, temp=2534, turb=320, cond=820, status=0, alarm=0, seq=1280 | 7 寄存器均解析正确 |
+| 2 | 传感器故障 | pH故障=0, temp饱和=32767, status=0x0003(bit0+bit1) | status 反射 pH+temp 故障 |
+| 3 | 阈值告警 | pH=450(4.50低), turb=5000(50.00高), alarm=0x0005(bit0+bit2) | alarm 反射 pH低+turb高 |
+| 4 | 边界最小值 | 全部寄存器 = 0x0000 | 7 个 0 值正常解析 |
+| 5 | 边界最大值 | 全部寄存器 = 0xFFFF | 7 个 0xFFFF，signed 溢出可观测 |
+| 6 | 异常响应 | func=0x83, code=0x02 | 识别为异常响应，返回 -1 |
+| 7 | CRC 错误 | 正常帧 CRC 被覆写为 0x0000 | CRC 校验失败，返回 -1 |
+| 8 | 短帧 | 仅 4 字节 (01 03 0E 02) | 帧太短被拒绝，返回 -1 |
+
+### 5. 寄存器到水质数据映射
+
+按计划书 register map 定义：
+
+| 寄存器地址 | 值(raw) | 缩放 | 解析结果 |
+|---|---|---|---|
+| 0x0000 | 712 | 0.01 | pH=7.12 |
+| 0x0001 | 2534 | 0.01 | temp=25.34 C |
+| 0x0002 | 320 | 0.01 | turbidity=3.20 NTU |
+| 0x0003 | 820 | 1 | conductivity=820 us/cm |
+| 0x0004 | 0 | - | sensor_status=0x0000 |
+| 0x0005 | 0 | - | alarm_status=0x0000 |
+| 0x0006 | 1 | - | sequence=1 |
+
+### 6. Makefile 说明
+
+Makefile 使用 `$(wildcard $(SRC_DIR)/*.c)` 自动收集源文件，新增 `modbus_rtu.c` 无需修改 Makefile 即可自动加入编译。
+
+交叉编译命令：
+
+```sh
+make clean
+make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+```
+
+### 7. 预期运行输出
+
+```text
+[2026-06-25 xx:xx:xx] [INFO] === modbus rtu sensor tests ===
+
+========================================
+  Modbus RTU Sensor Response Tests
+========================================
+
+[Test 1] Normal sensor data
+  frame: 01 03 0E 02 C8 09 E6 01 40 03 34 00 00 00 00 05 00 XX XX
+  result: 8 passed, 0 failed
+
+[Test 2] Sensor fault (pH+temp fault, status bit0+bit1)
+  frame: 01 03 0E 00 00 7F FF 01 40 03 34 00 03 00 00 08 00 XX XX
+  interpretation: pH fault(raw=0), temp saturated(raw=32767->327.67 C)
+  sensor_status=0x0003: bit0=pH fault, bit1=temp fault
+  result: 4 passed, 0 failed
+
+[Test 3] Threshold alarm (pH low + turbidity high, alarm bit0+bit2)
+  frame: 01 03 0E 01 C2 09 C4 13 88 05 DC 00 00 00 05 0C 00 XX XX
+  interpretation: pH=4.50 (low), turb=50.00 NTU (high)
+  alarm_status=0x0005: bit0=pH low, bit2=turb high
+  result: 4 passed, 0 failed
+
+[Test 4] Boundary: all registers zero
+  frame: 01 03 0E 00 00 00 00 00 00 00 00 00 00 00 00 00 00 XX XX
+  result: 8 passed, 0 failed
+
+[Test 5] Boundary: all registers 0xFFFF
+  frame: 01 03 0E FF FF FF FF FF FF FF FF FF FF FF FF FF FF XX XX
+  interpretation: pH=655.35 (overflow), temp=-0.01 (signed overflow)
+  result: 8 passed, 0 failed
+
+[Test 6] Exception response (illegal data address 0x02)
+  frame: 01 83 02 XX XX
+  correctly detected: exception code=2
+  result: 1 passed, 0 failed
+
+[Test 7] CRC error (corrupted checksum)
+  frame: 01 03 0E ... 00 00 (last 2 bytes corrupted)
+  correctly detected: CRC mismatch
+  result: 1 passed, 0 failed
+
+[Test 8] Short frame (only 4 bytes)
+  frame: 01 03 0E 02
+  correctly detected: frame too short
+  result: 1 passed, 0 failed
+
+========================================
+  Total: 35 passed, 0 failed
+========================================
+```
+
+### 8. 当日验收结论
+
+2026-06-25 的 Modbus RTU 基础模块和传感器测试案例开发完成。
+
+已完成内容：
+
+- `modbus_rtu.h` 和 `modbus_rtu.c` 模块完成
+- CRC16 校验实现
+- 0x03 读保持寄存器请求帧构造
+- 响应帧解析（含异常响应、CRC 校验、长度校验）
+- 十六进制 dump 调试工具 (`modbus_hex_dump`)
+- 8 传感器回复测试案例 (`modbus_run_sensor_tests`)，覆盖正常/故障/告警/边界/异常/CRC错误/短帧场景
+- `modbus_read_registers()` — 串口+Modbus 一体化收发函数（构造请求→串口发送→超时接收→解析响应）
+- `modbus_test_serial_read()` — 真实串口 Modbus 读取测试（有从机则显示真实数据，无从机则 fallback 到模拟测试）
+- `main.c` 逻辑更新：串口打开成功→走真实 Modbus 通讯；串口失败→走纯模拟测试
+
+### 9. 下一步计划
+
+- 在 Linux 主机上 `make` 编译验证
+- 交叉编译上传到 i.MX6ULL 开发板运行验证
+- 若开发板有 CH32/STM32 采集板接入 RS485，可直接用 `modbus_test_serial_read` 读取真实数据
+- 将 Modbus 响应解析结果替换模拟数据，接入 sample 数据结构
+- 准备进入阶段 3（多线程架构和 SQLite 缓存）

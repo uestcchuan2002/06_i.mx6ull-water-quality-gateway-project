@@ -19,6 +19,7 @@
 #include "../include/logger.h"
 #include "../include/sample.h"
 #include "../include/serial_port.h"
+#include "../include/modbus_rtu.h"
 
 #define DEFAULT_CONFIG_PATH "../config/gateway.conf"
 #define WATER_GATEWAY_VERSION "0.1.0"
@@ -118,10 +119,14 @@ int main(int argc, char *argv[])
     if (fd < 0)
     {
         log_warn("serial open failed: %s", cfg.serial_device);
+        log_info("running modbus tests in simulation mode");
+        modbus_run_sensor_tests();
     }
     else
     {
         log_info("serial open success: %s", cfg.serial_device);
+        log_info("=== modbus rtu sensor tests (serial mode) ===");
+        modbus_test_serial_read(fd);
         serial_close(fd);
     }
 
