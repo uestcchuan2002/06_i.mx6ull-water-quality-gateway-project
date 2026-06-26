@@ -2,7 +2,7 @@
  * @Author: uestcchuan2002 1992735052@qq.com
  * @Date: 2026-06-22 21:28:29
  * @LastEditors: uestcchuan2002 1992735052@qq.com
- * @LastEditTime: 2026-06-24 19:36:41
+ * @LastEditTime: 2026-06-26 10:01:13
  * @FilePath: /03_water_quality_gateway_project/app/src/main.c
  * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
@@ -80,7 +80,9 @@ int main(int argc, char *argv[])
     int parse_result;
     water_sample_t sample;
     char sample_buf[256];
-    int i;
+    int fd = -1;
+    int modbus_ok = 0;
+    int loop_count = 0;
 
     parse_result = parse_args(argc, argv, &config_path);
     if (parse_result > 0) {
@@ -107,26 +109,49 @@ int main(int argc, char *argv[])
     log_info("sample_period_ms=%d", cfg.sample_period_ms);
     log_info("serial_device=%s", cfg.serial_device);
     log_info("baudrate=%d", cfg.baudrate);
+    log_info("modbus_slave_addr=%d", cfg.modbus_slave_addr);
 
-    for (i = 0; i < 5; i++) {
-        sample_generate_mock(&sample);
+    fd = serial_open(cfg.serial_device, cfg.baudrate);
+    if (fd < 0) {
+        log_warn("serial open failed: %s, running with mock data", cfg.serial_device);
+    } else {
+        log_info("serial open success: %s", cfg.serial_device);
+    }
+
+    log_info("=== starting periodic acquisition loop ===");
+
+    while (1) {
+        unsigned short values[7];
+        int reg_count = -1;
+
+        if (fd >= 0) {
+            reg_count = modbus_read_registers(fd,
+                                              (unsigned char)cfg.modbus_slave_addr,
+                                              0x0000, 7, values, 7, 500);
+        }
+
+        if (reg_count == 7) {
+            sample_from_modbus_regs(&sample, values, 7);
+            if (!modbus_ok) {
+                log_info("modbus acquisition established");
+                modbus_ok = 1;
+            }
+        } else {
+            if (modbus_ok) {
+                log_warn("modbus read lost, falling back to mock data");
+                modbus_ok = 0;
+            }
+            sample_generate_mock(&sample);
+        }
+
         sample_to_string(&sample, sample_buf, sizeof(sample_buf));
-        log_info("%s", sample_buf);
+        log_info("[%s] #%d %s", modbus_ok ? "modbus" : "mock ", loop_count, sample_buf);
+
+        loop_count++;
         sleep_ms(cfg.sample_period_ms);
     }
 
-    int fd = serial_open(cfg.serial_device, cfg.baudrate);
-    if (fd < 0)
-    {
-        log_warn("serial open failed: %s", cfg.serial_device);
-        log_info("running modbus tests in simulation mode");
-        modbus_run_sensor_tests();
-    }
-    else
-    {
-        log_info("serial open success: %s", cfg.serial_device);
-        log_info("=== modbus rtu sensor tests (serial mode) ===");
-        modbus_test_serial_read(fd);
+    if (fd >= 0) {
         serial_close(fd);
     }
 

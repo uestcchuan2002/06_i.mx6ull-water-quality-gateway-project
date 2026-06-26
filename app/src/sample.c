@@ -61,6 +61,22 @@ void sample_generate_mock(water_sample_t *sample)
     sample->sequence = seq;
 }
 
+void sample_from_modbus_regs(water_sample_t *sample, const unsigned short *regs, int reg_count)
+{
+    if (sample == NULL || regs == NULL || reg_count < 7) {
+        return;
+    }
+
+    sample->timestamp_ms = sample_now_ms();
+    sample->ph = (float)regs[0] * 0.01f;
+    sample->temperature = (float)((signed short)regs[1]) * 0.01f;
+    sample->turbidity = (float)regs[2] * 0.01f;
+    sample->conductivity = (float)regs[3];
+    sample->sensor_status = (unsigned int)regs[4];
+    sample->alarm_status = (unsigned int)regs[5];
+    sample->sequence = (unsigned int)regs[6];
+}
+
 int sample_to_string(const water_sample_t *sample, char *buf, size_t buf_size)
 {
     if (sample == NULL || buf == NULL || buf_size == 0) {

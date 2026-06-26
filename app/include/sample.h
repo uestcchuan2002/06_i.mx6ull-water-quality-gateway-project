@@ -16,6 +16,7 @@ typedef struct {
 
 void sample_init(water_sample_t *sample);
 void sample_generate_mock(water_sample_t *sample);
+void sample_from_modbus_regs(water_sample_t *sample, const unsigned short *regs, int reg_count);
 int sample_to_string(const water_sample_t *sample, char *buf, size_t buf_size);
 
 #endif

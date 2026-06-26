@@ -54,6 +54,7 @@ void config_set_default(gateway_config_t *cfg)
     copy_string(cfg->log_level, sizeof(cfg->log_level), "info");
     copy_string(cfg->serial_device, sizeof(cfg->serial_device), "/dev/ttyUSB0");
     cfg->baudrate = 9600;
+    cfg->modbus_slave_addr = 1;
 }
 
 int config_load(const char *path, gateway_config_t *cfg)
@@ -109,6 +110,8 @@ int config_load(const char *path, gateway_config_t *cfg)
             copy_string(cfg->serial_device, sizeof(cfg->serial_device), value);
         } else if (strcmp(key, "baudrate") == 0) {
             cfg->baudrate = atoi(value);
+        } else if (strcmp(key, "modbus_slave_addr") == 0) {
+            cfg->modbus_slave_addr = atoi(value);
         } else {
             fprintf(stderr, "unknown config key at line %d: %s\n", line_no, key);
         }
@@ -126,6 +129,11 @@ int config_load(const char *path, gateway_config_t *cfg)
         cfg->baudrate = 9600;
     }
 
+    if (cfg->modbus_slave_addr < 1 || cfg->modbus_slave_addr > 247) {
+        fprintf(stderr, "invalid modbus_slave_addr, use default 1\n");
+        cfg->modbus_slave_addr = 1;
+    }
+
     return 0;
 }
 
@@ -141,6 +149,7 @@ void config_print(const gateway_config_t *cfg)
     printf("  log_level        = %s\n", cfg->log_level);
     printf("  serial_device    = %s\n", cfg->serial_device);
     printf("  baudrate         = %d\n", cfg->baudrate);
+    printf("  modbus_slave_addr= %d\n", cfg->modbus_slave_addr);
 }
 
 

@@ -139,6 +139,17 @@ void modbus_hex_dump(const unsigned char *buf, int len, char *out, int out_size)
     }
 }
 
+/*
+ * 通过 Modbus RTU 协议读取保持寄存器 (功能码 0x03)
+ * fd:          串口文件描述符
+ * slave_addr:  从机地址 (1-247)
+ * start_addr:  起始寄存器地址
+ * quantity:    要读取的寄存器数量
+ * values:      输出缓冲区，存放读取到的寄存器值
+ * max_values:  values 缓冲区最大容量
+ * timeout_ms:  接收超时时间 (毫秒)
+ * 返回值: 成功返回读取到的寄存器个数，失败返回 -1
+ */
 int modbus_read_registers(int fd, unsigned char slave_addr,
                           unsigned short start_addr, unsigned short quantity,
                           unsigned short *values, int max_values,
@@ -149,29 +160,35 @@ int modbus_read_registers(int fd, unsigned char slave_addr,
     int req_len, resp_len;
     char hex[256];
 
+    // 构建 Modbus 读寄存器请求帧
     req_len = modbus_build_read_request(slave_addr, start_addr, quantity,
                                         request, (int)sizeof(request));
     if (req_len < 0) {
         return -1;
     }
 
+    // 打印发送帧 (十六进制)
     modbus_hex_dump(request, req_len, hex, sizeof(hex));
     printf("  TX: %s\n", hex);
 
+    // 发送请求帧到串口
     if (serial_write(fd, request, req_len) != req_len) {
         fprintf(stderr, "modbus: serial write failed\n");
         return -1;
     }
 
+    // 等待并读取从机响应
     resp_len = serial_read(fd, response, (int)sizeof(response), timeout_ms);
     if (resp_len <= 0) {
         fprintf(stderr, "modbus: no response (timeout)\n");
         return -1;
     }
 
+    // 打印接收帧 (十六进制)
     modbus_hex_dump(response, resp_len, hex, sizeof(hex));
     printf("  RX: %s\n", hex);
 
+    // 解析响应帧，提取寄存器值
     return modbus_parse_response(response, resp_len, values, max_values);
 }
 
