@@ -16,6 +16,8 @@ typedef struct {
     char serial_device[128];
     int baudrate;
     int modbus_slave_addr;
+    char db_path[256];
+    int max_cache_count;
 } gateway_config_t;
 
 

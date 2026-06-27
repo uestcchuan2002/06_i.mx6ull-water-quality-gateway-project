@@ -16,9 +16,10 @@
 #include "../include/sample.h"
 #include "../include/sample_queue.h"
 #include "../include/serial_port.h"
+#include "../include/sqlite_store.h"
 
 #define DEFAULT_CONFIG_PATH "../config/gateway.conf"
-#define WATER_GATEWAY_VERSION "0.2.0"
+#define WATER_GATEWAY_VERSION "0.3.0"
 #define DEFAULT_QUEUE_CAPACITY 64
 #define DEFAULT_TEST_ITERATIONS 10
 
@@ -154,8 +155,11 @@ static int run_test(int iterations)
     gateway_config_t cfg;
     collect_ctx_t collect_ctx;
     processor_ctx_t proc_ctx;
+    sqlite_store_ctx_t store_ctx;
+    sqlite3 *db = NULL;
     pthread_t collect_tid;
     pthread_t proc_tid;
+    pthread_t store_tid;
     int i;
 
     config_set_default(&cfg);
@@ -176,6 +180,21 @@ static int run_test(int iterations)
         return 1;
     }
 
+    if (sqlite_store_open(":memory:", &db) != 0) {
+        log_error("failed to open in-memory database");
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
+        return 1;
+    }
+
+    if (sqlite_store_create_table(db) != 0) {
+        log_error("failed to create table");
+        sqlite_store_close(db);
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
+        return 1;
+    }
+
     memset(&collect_ctx, 0, sizeof(collect_ctx));
     collect_ctx.cfg = &cfg;
     collect_ctx.serial_fd = -1;
@@ -187,8 +206,16 @@ static int run_test(int iterations)
     proc_ctx.shutdown = 0;
     processor_threshold_default(&proc_ctx.thresholds);
 
+    memset(&store_ctx, 0, sizeof(store_ctx));
+    store_ctx.store_queue = store_queue;
+    store_ctx.db = db;
+    store_ctx.device_id = cfg.device_id;
+    store_ctx.max_cache_count = cfg.max_cache_count;
+    store_ctx.shutdown = 0;
+
     if (pthread_create(&collect_tid, NULL, collect_thread_mock, &collect_ctx) != 0) {
         log_error("failed to create collect thread");
+        sqlite_store_close(db);
         sample_queue_destroy(raw_queue);
         sample_queue_destroy(store_queue);
         return 1;
@@ -198,6 +225,21 @@ static int run_test(int iterations)
         log_error("failed to create processor thread");
         g_shutdown = 1;
         pthread_join(collect_tid, NULL);
+        sqlite_store_close(db);
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
+        return 1;
+    }
+
+    if (pthread_create(&store_tid, NULL, sqlite_store_thread, &store_ctx) != 0) {
+        log_error("failed to create store thread");
+        g_shutdown = 1;
+        proc_ctx.shutdown = 1;
+        sample_queue_shutdown(raw_queue);
+        sample_queue_shutdown(store_queue);
+        pthread_join(collect_tid, NULL);
+        pthread_join(proc_tid, NULL);
+        sqlite_store_close(db);
         sample_queue_destroy(raw_queue);
         sample_queue_destroy(store_queue);
         return 1;
@@ -209,11 +251,13 @@ static int run_test(int iterations)
 
     g_shutdown = 1;
     proc_ctx.shutdown = 1;
+    store_ctx.shutdown = 1;
     sample_queue_shutdown(raw_queue);
     sample_queue_shutdown(store_queue);
 
     pthread_join(collect_tid, NULL);
     pthread_join(proc_tid, NULL);
+    pthread_join(store_tid, NULL);
 
     log_info("=== test complete ===");
     log_info("raw_queue:    pushed=%lu overflow=%lu",
@@ -223,7 +267,13 @@ static int run_test(int iterations)
              sample_queue_push_count(store_queue),
              sample_queue_overflow_count(store_queue),
              sample_queue_count(store_queue));
+    log_info("store_thread: written=%lu failed=%lu",
+             store_ctx.write_count, store_ctx.write_fail_count);
+    log_info("db:           total_samples=%d unuploaded=%d",
+             sqlite_store_get_total_count(db),
+             sqlite_store_get_unuploaded_count(db));
 
+    sqlite_store_close(db);
     sample_queue_destroy(raw_queue);
     sample_queue_destroy(store_queue);
 
@@ -281,6 +331,8 @@ int main(int argc, char *argv[])
     log_info("serial_device=%s", cfg.serial_device);
     log_info("baudrate=%d", cfg.baudrate);
     log_info("modbus_slave_addr=%d", cfg.modbus_slave_addr);
+    log_info("db_path=%s", cfg.db_path);
+    log_info("max_cache_count=%d", cfg.max_cache_count);
 
     if (test_iterations > 0) {
         return run_test(test_iterations);
@@ -302,14 +354,34 @@ int main(int argc, char *argv[])
         sample_queue_t *store_queue;
         collect_ctx_t collect_ctx;
         processor_ctx_t proc_ctx;
+        sqlite_store_ctx_t store_ctx;
+        sqlite3 *db = NULL;
         pthread_t collect_tid;
         pthread_t proc_tid;
+        pthread_t store_tid;
 
         raw_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
         store_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
 
         if (raw_queue == NULL || store_queue == NULL) {
             log_error("failed to create queues");
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        if (sqlite_store_open(cfg.db_path, &db) != 0) {
+            log_error("failed to open database: %s", cfg.db_path);
+            sample_queue_destroy(raw_queue);
+            sample_queue_destroy(store_queue);
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        if (sqlite_store_create_table(db) != 0) {
+            log_error("failed to create table");
+            sqlite_store_close(db);
+            sample_queue_destroy(raw_queue);
+            sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
             return 1;
         }
@@ -325,10 +397,18 @@ int main(int argc, char *argv[])
         proc_ctx.shutdown = 0;
         processor_threshold_default(&proc_ctx.thresholds);
 
+        memset(&store_ctx, 0, sizeof(store_ctx));
+        store_ctx.store_queue = store_queue;
+        store_ctx.db = db;
+        store_ctx.device_id = cfg.device_id;
+        store_ctx.max_cache_count = cfg.max_cache_count;
+        store_ctx.shutdown = 0;
+
         log_info("=== starting multi-threaded pipeline ===");
 
         if (pthread_create(&collect_tid, NULL, collect_thread, &collect_ctx) != 0) {
             log_error("failed to create collect thread");
+            sqlite_store_close(db);
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
@@ -340,6 +420,22 @@ int main(int argc, char *argv[])
             g_shutdown = 1;
             sample_queue_shutdown(raw_queue);
             pthread_join(collect_tid, NULL);
+            sqlite_store_close(db);
+            sample_queue_destroy(raw_queue);
+            sample_queue_destroy(store_queue);
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        if (pthread_create(&store_tid, NULL, sqlite_store_thread, &store_ctx) != 0) {
+            log_error("failed to create store thread");
+            g_shutdown = 1;
+            proc_ctx.shutdown = 1;
+            sample_queue_shutdown(raw_queue);
+            sample_queue_shutdown(store_queue);
+            pthread_join(collect_tid, NULL);
+            pthread_join(proc_tid, NULL);
+            sqlite_store_close(db);
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
@@ -352,11 +448,13 @@ int main(int argc, char *argv[])
 
         log_info("shutting down...");
         proc_ctx.shutdown = 1;
+        store_ctx.shutdown = 1;
         sample_queue_shutdown(raw_queue);
         sample_queue_shutdown(store_queue);
 
         pthread_join(collect_tid, NULL);
         pthread_join(proc_tid, NULL);
+        pthread_join(store_tid, NULL);
 
         log_info("=== pipeline stopped ===");
         log_info("raw_queue:    pushed=%lu overflow=%lu remaining=%d",
@@ -367,7 +465,13 @@ int main(int argc, char *argv[])
                  sample_queue_push_count(store_queue),
                  sample_queue_overflow_count(store_queue),
                  sample_queue_count(store_queue));
+        log_info("store_thread:  written=%lu failed=%lu",
+                 store_ctx.write_count, store_ctx.write_fail_count);
+        log_info("db:            total_samples=%d unuploaded=%d",
+                 sqlite_store_get_total_count(db),
+                 sqlite_store_get_unuploaded_count(db));
 
+        sqlite_store_close(db);
         sample_queue_destroy(raw_queue);
         sample_queue_destroy(store_queue);
     }

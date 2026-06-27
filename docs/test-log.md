@@ -1099,6 +1099,192 @@ collect_thread → raw_queue → processor_thread → store_queue → (SQLite待
 
 ### 9. 下一步计划
 
-- 接入 SQLite：创建 `samples` 表，实现存储线程
-- 实现查询未上传数据接口
-- 为阶段 4 (MQTT/TCP 上传和补传) 做准备
+- 进入阶段4：MQTT/TCP 上传
+
+---
+
+## 2026-06-27 SQLite 存储模块和存储线程
+
+### 1. 当日目标
+
+完成阶段3后半部分——SQLite 存储模块和存储线程，形成完整的 3 线程数据管线：
+
+- 创建 `sqlite_store.h/c`：SQLite 存储模块
+- 创建 `samples` 表（12 字段，含 uploaded/upload_retry）
+- 实现存储线程（从 store_queue 拉取写入 SQLite）
+- 实现查询未上传数据、标记上传成功/失败、缓存裁剪
+- 更新配置文件增加 `db_path` 和 `max_cache_count`
+
+### 2. 新增和修改文件
+
+```text
+app/include/sqlite_store.h   (新增)
+app/src/sqlite_store.c       (新增)
+app/include/config.h         (修改：新增 db_path/max_cache_count)
+app/src/config.c             (修改：解析新配置项)
+app/src/main.c               (修改：新增 store 线程，版本 0.2.0→0.3.0)
+app/Makefile                 (修改：链接 -lsqlite3)
+config/gateway.conf          (修改：新增 db_path/max_cache_count)
+```
+
+### 3. SQLite 表结构
+
+```sql
+CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    ph REAL NOT NULL,
+    temperature REAL NOT NULL,
+    turbidity REAL NOT NULL,
+    conductivity REAL NOT NULL,
+    sensor_status INTEGER NOT NULL,
+    alarm_status INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    uploaded INTEGER NOT NULL DEFAULT 0,
+    upload_retry INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_samples_uploaded ON samples(uploaded);
+CREATE INDEX IF NOT EXISTS idx_samples_timestamp ON samples(timestamp_ms);
+```
+
+### 4. 模块接口
+
+| 函数 | 说明 |
+|------|------|
+| `sqlite_store_open` | 打开数据库，启用 WAL 模式 + NORMAL 同步 |
+| `sqlite_store_create_table` | 建表 + 创建 uploaded/timestamp_ms 索引 |
+| `sqlite_store_insert` | 绑定参数化插入（防 SQL 注入）|
+| `sqlite_store_get_unuploaded_count` | SELECT COUNT(*) WHERE uploaded=0 |
+| `sqlite_store_get_total_count` | SELECT COUNT(*) 总记录数 |
+| `sqlite_store_mark_uploaded(id)` | UPDATE SET uploaded=1 |
+| `sqlite_store_inc_retry(id)` | UPDATE SET upload_retry=upload_retry+1 |
+| `sqlite_store_trim_cache(max)` | 超出上限先删已上传旧数据 |
+| `sqlite_store_close` | 关闭数据库 |
+
+### 5. 存储线程设计
+
+```c
+void *sqlite_store_thread(void *arg)
+{
+    while (!ctx->shutdown) {
+        sample_queue_pop(ctx->store_queue, &sample, 500);
+        sqlite_store_insert(ctx->db, ctx->device_id, &sample);
+        if (ctx->sample_counter % 100 == 0) {
+            sqlite_store_trim_cache(ctx->db, ctx->max_cache_count);
+        }
+    }
+    // 优雅退出：排空 queue 中剩余数据
+    while (sample_queue_count(ctx->store_queue) > 0) {
+        sample_queue_pop(...);
+        sqlite_store_insert(...);
+    }
+    sqlite_store_trim_cache(...);
+}
+```
+
+### 6. 3 线程完整管线架构
+
+```
+collect_thread → raw_queue → processor_thread → store_queue → store_thread → SQLite
+```
+
+### 7. 配置文件变更
+
+```ini
+# 新增配置项
+db_path=water_gateway.db      # 数据库文件路径（默认 water_gateway.db）
+max_cache_count=100000         # 最大缓存条数（默认 100000）
+```
+
+### 8. 编译验证
+
+```sh
+cd app
+make clean && make LDFLAGS=
+```
+
+编译结果：
+
+```text
+gcc -Iinclude -std=gnu99 -Wall -Wextra -O2 -g -MMD -MP -c src/*.c -o build/*.o
+gcc build/*.o -o water_gateway -lpthread -lsqlite3
+```
+
+编译通过，**零警告零错误**。
+
+### 9. 测试运行
+
+```sh
+./water_gateway -c ../config/gateway.conf --test 10
+```
+
+关键输出：
+
+```text
+[2026-06-27 15:41:28] [INFO] water gateway start (v0.3.0)
+[2026-06-27 15:41:28] [INFO] db_path=water_gateway.db
+[2026-06-27 15:41:28] [INFO] max_cache_count=100000
+[2026-06-27 15:41:28] [INFO] === thread pipeline test: 10 iterations ===
+[2026-06-27 15:41:28] [INFO] sqlite database opened: :memory:
+[2026-06-27 15:41:28] [INFO] sqlite table 'samples' ready
+[2026-06-27 15:41:28] [INFO] collect thread started (mock only)
+[2026-06-27 15:41:28] [INFO] processor thread started
+[2026-06-27 15:41:28] [INFO] store thread started
+[2026-06-27 15:41:28] [INFO] [proc] #1 ... ph=7.01 temperature=25.01 ...
+[2026-06-27 15:41:29] [INFO] [proc] #20 ... ph=7.00 temperature=25.20 ...
+[2026-06-27 15:41:29] [INFO] processor thread stopped (processed 20 samples)
+[2026-06-27 15:41:29] [INFO] store thread stopped (processed 20 samples, written 20, failed 0)
+[2026-06-27 15:41:29] [INFO] collect thread stopped
+[2026-06-27 15:41:29] [INFO] === test complete ===
+[2026-06-27 15:41:29] [INFO] raw_queue:    pushed=20 overflow=0
+[2026-06-27 15:41:29] [INFO] store_queue:  pushed=20 overflow=0 final_count=0
+[2026-06-27 15:41:29] [INFO] store_thread: written=20 failed=0
+[2026-06-27 15:41:29] [INFO] db:           total_samples=20 unuploaded=20
+[2026-06-27 15:41:29] [INFO] sqlite database closed
+```
+
+### 10. 验证结论
+
+| 指标 | 结果 |
+|------|------|
+| raw_queue 推送 | 20 条，overflow=0 |
+| store_queue 推送 | 20 条，overflow=0 |
+| store_thread 写入 | 20 条，fail=0 (100% 成功率) |
+| SQLite 总记录 | 20 条 |
+| SQLite 未上传 | 20 条 (uploaded=0) |
+| store_queue 最终剩余 | 0 条 (完全排空) |
+| 3 线程退出 | 全部优雅退出 |
+| 数据库关闭 | 正常关闭 |
+
+### 11. 当日验收结论
+
+2026-06-27 的 SQLite 存储模块和存储线程开发完成，阶段3全线完工。
+
+已完成内容：
+
+- `sqlite_store.h/c`：完整 SQLite 存储模块
+- `samples` 表：12 字段 + 2 索引
+- store 线程：第 3 个线程接入管线
+- 查询未上传/总记录数接口
+- 标记上传成功/失败接口
+- 缓存裁剪（优先删已上传旧数据）
+- 配置文件扩展（db_path / max_cache_count）
+- 版本号升级：v0.2.0 → v0.3.0
+
+数据管线已闭环：
+
+```
+collect_thread → raw_queue → processor_thread → store_queue → store_thread → SQLite (water_gateway.db)
+```
+
+--test 模式使用内存数据库，无需清理文件，适合 CI/CD 快速验证。
+
+### 12. 下一步计划
+
+- 进入阶段4：实现 upload 线程，MQTT/TCP 上传
+- JSON 数据打包（按计划书格式）
+- 上传失败保留 uploaded=0
+- 补传机制：查询 uploaded=0 批量上传并标记

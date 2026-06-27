@@ -55,6 +55,8 @@ void config_set_default(gateway_config_t *cfg)
     copy_string(cfg->serial_device, sizeof(cfg->serial_device), "/dev/ttyUSB0");
     cfg->baudrate = 9600;
     cfg->modbus_slave_addr = 1;
+    copy_string(cfg->db_path, sizeof(cfg->db_path), "water_gateway.db");
+    cfg->max_cache_count = 100000;
 }
 
 int config_load(const char *path, gateway_config_t *cfg)
@@ -112,6 +114,10 @@ int config_load(const char *path, gateway_config_t *cfg)
             cfg->baudrate = atoi(value);
         } else if (strcmp(key, "modbus_slave_addr") == 0) {
             cfg->modbus_slave_addr = atoi(value);
+        } else if (strcmp(key, "db_path") == 0) {
+            copy_string(cfg->db_path, sizeof(cfg->db_path), value);
+        } else if (strcmp(key, "max_cache_count") == 0) {
+            cfg->max_cache_count = atoi(value);
         } else {
             fprintf(stderr, "unknown config key at line %d: %s\n", line_no, key);
         }
@@ -134,6 +140,10 @@ int config_load(const char *path, gateway_config_t *cfg)
         cfg->modbus_slave_addr = 1;
     }
 
+    if (cfg->max_cache_count <= 0) {
+        cfg->max_cache_count = 100000;
+    }
+
     return 0;
 }
 
@@ -150,6 +160,8 @@ void config_print(const gateway_config_t *cfg)
     printf("  serial_device    = %s\n", cfg->serial_device);
     printf("  baudrate         = %d\n", cfg->baudrate);
     printf("  modbus_slave_addr= %d\n", cfg->modbus_slave_addr);
+    printf("  db_path         = %s\n", cfg->db_path);
+    printf("  max_cache_count = %d\n", cfg->max_cache_count);
 }
 
 
