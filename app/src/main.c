@@ -1,12 +1,6 @@
-/*
- * @Author: uestcchuan2002 1992735052@qq.com
- * @Date: 2026-06-22 21:28:29
- * @LastEditors: uestcchuan2002 1992735052@qq.com
- * @LastEditTime: 2026-06-26 10:01:13
- * @FilePath: /03_water_quality_gateway_project/app/src/main.c
- * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
- */
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -17,47 +11,52 @@
 
 #include "../include/config.h"
 #include "../include/logger.h"
-#include "../include/sample.h"
-#include "../include/serial_port.h"
 #include "../include/modbus_rtu.h"
+#include "../include/processor.h"
+#include "../include/sample.h"
+#include "../include/sample_queue.h"
+#include "../include/serial_port.h"
 
 #define DEFAULT_CONFIG_PATH "../config/gateway.conf"
-#define WATER_GATEWAY_VERSION "0.1.0"
+#define WATER_GATEWAY_VERSION "0.2.0"
+#define DEFAULT_QUEUE_CAPACITY 64
+#define DEFAULT_TEST_ITERATIONS 10
+
+static volatile sig_atomic_t g_shutdown = 0;
+
+static void signal_handler(int sig)
+{
+    (void)sig;
+    g_shutdown = 1;
+}
 
 static void print_usage(const char *program)
 {
-    printf("Usage: %s [-c config_path] [-h] [-v]\n", program);
-    printf("  -c, --config   config file path, default: %s\n", DEFAULT_CONFIG_PATH);
-    printf("  -h, --help     show help\n");
-    printf("  -v, --version  show version\n");
+    printf("Usage: %s [options]\n", program);
+    printf("  -c, --config <path>  config file path (default: %s)\n",
+           DEFAULT_CONFIG_PATH);
+    printf("  -h, --help           show help\n");
+    printf("  -v, --version        show version\n");
+    printf("  --test [N]           run thread pipeline test with N mock samples "
+           "(default: %d)\n",
+           DEFAULT_TEST_ITERATIONS);
 }
 
-static int parse_args(int argc, char *argv[], const char **config_path)
+static int str_to_int(const char *str, int default_val)
 {
-    int i;
+    int val;
+    char *end = NULL;
 
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
-            if (i + 1 >= argc) {
-                fprintf(stderr, "missing config path after %s\n", argv[i]);
-                return -1;
-            }
-
-            *config_path = argv[++i];
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 1;
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("water_gateway version %s\n", WATER_GATEWAY_VERSION);
-            return 1;
-        } else {
-            fprintf(stderr, "unknown argument: %s\n", argv[i]);
-            print_usage(argv[0]);
-            return -1;
-        }
+    if (str == NULL) {
+        return default_val;
     }
 
-    return 0;
+    val = (int)strtol(str, &end, 10);
+    if (end == str || *end != '\0') {
+        return default_val;
+    }
+
+    return val;
 }
 
 static void sleep_ms(int ms)
@@ -73,60 +72,31 @@ static void sleep_ms(int ms)
 #endif
 }
 
-int main(int argc, char *argv[])
+typedef struct {
+    gateway_config_t *cfg;
+    int serial_fd;
+    sample_queue_t *raw_queue;
+} collect_ctx_t;
+
+static void *collect_thread(void *arg)
 {
-    gateway_config_t cfg;
-    const char *config_path = DEFAULT_CONFIG_PATH;
-    int parse_result;
-    water_sample_t sample;
-    char sample_buf[256];
-    int fd = -1;
+    collect_ctx_t *ctx = (collect_ctx_t *)arg;
     int modbus_ok = 0;
-    int loop_count = 0;
 
-    parse_result = parse_args(argc, argv, &config_path);
-    if (parse_result > 0) {
-        return 0;
+    if (ctx == NULL || ctx->raw_queue == NULL) {
+        return NULL;
     }
 
-    if (parse_result < 0) {
-        return 1;
-    }
+    log_info("collect thread started");
 
-    logger_init("info");
-    log_info("water gateway start");
-    log_info("config_path=%s", config_path);
-
-    if (config_load(config_path, &cfg) != 0) {
-        log_error("load config failed: %s", config_path);
-        return 1;
-    }
-
-    logger_init(cfg.log_level);
-
-    log_info("config loaded");
-    log_info("device_id=%s", cfg.device_id);
-    log_info("sample_period_ms=%d", cfg.sample_period_ms);
-    log_info("serial_device=%s", cfg.serial_device);
-    log_info("baudrate=%d", cfg.baudrate);
-    log_info("modbus_slave_addr=%d", cfg.modbus_slave_addr);
-
-    fd = serial_open(cfg.serial_device, cfg.baudrate);
-    if (fd < 0) {
-        log_warn("serial open failed: %s, running with mock data", cfg.serial_device);
-    } else {
-        log_info("serial open success: %s", cfg.serial_device);
-    }
-
-    log_info("=== starting periodic acquisition loop ===");
-
-    while (1) {
+    while (!g_shutdown) {
+        water_sample_t sample;
         unsigned short values[7];
         int reg_count = -1;
 
-        if (fd >= 0) {
-            reg_count = modbus_read_registers(fd,
-                                              (unsigned char)cfg.modbus_slave_addr,
+        if (ctx->serial_fd >= 0) {
+            reg_count = modbus_read_registers(ctx->serial_fd,
+                                              (unsigned char)ctx->cfg->modbus_slave_addr,
                                               0x0000, 7, values, 7, 500);
         }
 
@@ -144,11 +114,262 @@ int main(int argc, char *argv[])
             sample_generate_mock(&sample);
         }
 
-        sample_to_string(&sample, sample_buf, sizeof(sample_buf));
-        log_info("[%s] #%d %s", modbus_ok ? "modbus" : "mock ", loop_count, sample_buf);
+        sample_queue_push(ctx->raw_queue, &sample, 100);
 
-        loop_count++;
-        sleep_ms(cfg.sample_period_ms);
+        sleep_ms(ctx->cfg->sample_period_ms);
+    }
+
+    log_info("collect thread stopped");
+    return NULL;
+}
+
+static void *collect_thread_mock(void *arg)
+{
+    collect_ctx_t *ctx = (collect_ctx_t *)arg;
+
+    if (ctx == NULL || ctx->raw_queue == NULL) {
+        return NULL;
+    }
+
+    log_info("collect thread started (mock only)");
+
+    while (!g_shutdown) {
+        water_sample_t sample;
+
+        sample_generate_mock(&sample);
+
+        sample_queue_push(ctx->raw_queue, &sample, 100);
+
+        sleep_ms(ctx->cfg->sample_period_ms);
+    }
+
+    log_info("collect thread stopped");
+    return NULL;
+}
+
+static int run_test(int iterations)
+{
+    sample_queue_t *raw_queue;
+    sample_queue_t *store_queue;
+    gateway_config_t cfg;
+    collect_ctx_t collect_ctx;
+    processor_ctx_t proc_ctx;
+    pthread_t collect_tid;
+    pthread_t proc_tid;
+    int i;
+
+    config_set_default(&cfg);
+    cfg.sample_period_ms = 50;
+
+    log_info("=== thread pipeline test: %d iterations ===", iterations);
+
+    raw_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
+    if (raw_queue == NULL) {
+        log_error("failed to create raw_queue");
+        return 1;
+    }
+
+    store_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
+    if (store_queue == NULL) {
+        log_error("failed to create store_queue");
+        sample_queue_destroy(raw_queue);
+        return 1;
+    }
+
+    memset(&collect_ctx, 0, sizeof(collect_ctx));
+    collect_ctx.cfg = &cfg;
+    collect_ctx.serial_fd = -1;
+    collect_ctx.raw_queue = raw_queue;
+
+    memset(&proc_ctx, 0, sizeof(proc_ctx));
+    proc_ctx.raw_queue = raw_queue;
+    proc_ctx.store_queue = store_queue;
+    proc_ctx.shutdown = 0;
+    processor_threshold_default(&proc_ctx.thresholds);
+
+    if (pthread_create(&collect_tid, NULL, collect_thread_mock, &collect_ctx) != 0) {
+        log_error("failed to create collect thread");
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
+        return 1;
+    }
+
+    if (pthread_create(&proc_tid, NULL, processor_thread, &proc_ctx) != 0) {
+        log_error("failed to create processor thread");
+        g_shutdown = 1;
+        pthread_join(collect_tid, NULL);
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
+        return 1;
+    }
+
+    for (i = 0; i < iterations; i++) {
+        sleep_ms(100);
+    }
+
+    g_shutdown = 1;
+    proc_ctx.shutdown = 1;
+    sample_queue_shutdown(raw_queue);
+    sample_queue_shutdown(store_queue);
+
+    pthread_join(collect_tid, NULL);
+    pthread_join(proc_tid, NULL);
+
+    log_info("=== test complete ===");
+    log_info("raw_queue:    pushed=%lu overflow=%lu",
+             sample_queue_push_count(raw_queue),
+             sample_queue_overflow_count(raw_queue));
+    log_info("store_queue:  pushed=%lu overflow=%lu final_count=%d",
+             sample_queue_push_count(store_queue),
+             sample_queue_overflow_count(store_queue),
+             sample_queue_count(store_queue));
+
+    sample_queue_destroy(raw_queue);
+    sample_queue_destroy(store_queue);
+
+    return 0;
+}
+
+int main(int argc, char *argv[])
+{
+    gateway_config_t cfg;
+    const char *config_path = DEFAULT_CONFIG_PATH;
+    int i;
+    int test_iterations = 0;
+    int fd = -1;
+
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "missing config path after %s\n", argv[i]);
+                return 1;
+            }
+            config_path = argv[++i];
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+            printf("water_gateway version %s\n", WATER_GATEWAY_VERSION);
+            return 0;
+        } else if (strcmp(argv[i], "--test") == 0) {
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                test_iterations = str_to_int(argv[++i], DEFAULT_TEST_ITERATIONS);
+            } else {
+                test_iterations = DEFAULT_TEST_ITERATIONS;
+            }
+        } else {
+            fprintf(stderr, "unknown argument: %s\n", argv[i]);
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    logger_init("info");
+    log_info("water gateway start (v%s)", WATER_GATEWAY_VERSION);
+    log_info("config_path=%s", config_path);
+
+    if (config_load(config_path, &cfg) != 0) {
+        log_error("load config failed: %s", config_path);
+        return 1;
+    }
+
+    logger_init(cfg.log_level);
+
+    log_info("config loaded");
+    log_info("device_id=%s", cfg.device_id);
+    log_info("sample_period_ms=%d", cfg.sample_period_ms);
+    log_info("serial_device=%s", cfg.serial_device);
+    log_info("baudrate=%d", cfg.baudrate);
+    log_info("modbus_slave_addr=%d", cfg.modbus_slave_addr);
+
+    if (test_iterations > 0) {
+        return run_test(test_iterations);
+    }
+
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    fd = serial_open(cfg.serial_device, cfg.baudrate);
+    if (fd < 0) {
+        log_warn("serial open failed: %s, running with mock data",
+                 cfg.serial_device);
+    } else {
+        log_info("serial open success: %s", cfg.serial_device);
+    }
+
+    {
+        sample_queue_t *raw_queue;
+        sample_queue_t *store_queue;
+        collect_ctx_t collect_ctx;
+        processor_ctx_t proc_ctx;
+        pthread_t collect_tid;
+        pthread_t proc_tid;
+
+        raw_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
+        store_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
+
+        if (raw_queue == NULL || store_queue == NULL) {
+            log_error("failed to create queues");
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        memset(&collect_ctx, 0, sizeof(collect_ctx));
+        collect_ctx.cfg = &cfg;
+        collect_ctx.serial_fd = fd;
+        collect_ctx.raw_queue = raw_queue;
+
+        memset(&proc_ctx, 0, sizeof(proc_ctx));
+        proc_ctx.raw_queue = raw_queue;
+        proc_ctx.store_queue = store_queue;
+        proc_ctx.shutdown = 0;
+        processor_threshold_default(&proc_ctx.thresholds);
+
+        log_info("=== starting multi-threaded pipeline ===");
+
+        if (pthread_create(&collect_tid, NULL, collect_thread, &collect_ctx) != 0) {
+            log_error("failed to create collect thread");
+            sample_queue_destroy(raw_queue);
+            sample_queue_destroy(store_queue);
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        if (pthread_create(&proc_tid, NULL, processor_thread, &proc_ctx) != 0) {
+            log_error("failed to create processor thread");
+            g_shutdown = 1;
+            sample_queue_shutdown(raw_queue);
+            pthread_join(collect_tid, NULL);
+            sample_queue_destroy(raw_queue);
+            sample_queue_destroy(store_queue);
+            if (fd >= 0) serial_close(fd);
+            return 1;
+        }
+
+        while (!g_shutdown) {
+            sleep_ms(200);
+        }
+
+        log_info("shutting down...");
+        proc_ctx.shutdown = 1;
+        sample_queue_shutdown(raw_queue);
+        sample_queue_shutdown(store_queue);
+
+        pthread_join(collect_tid, NULL);
+        pthread_join(proc_tid, NULL);
+
+        log_info("=== pipeline stopped ===");
+        log_info("raw_queue:    pushed=%lu overflow=%lu remaining=%d",
+                 sample_queue_push_count(raw_queue),
+                 sample_queue_overflow_count(raw_queue),
+                 sample_queue_count(raw_queue));
+        log_info("store_queue:  pushed=%lu overflow=%lu remaining=%d",
+                 sample_queue_push_count(store_queue),
+                 sample_queue_overflow_count(store_queue),
+                 sample_queue_count(store_queue));
+
+        sample_queue_destroy(raw_queue);
+        sample_queue_destroy(store_queue);
     }
 
     if (fd >= 0) {
@@ -157,4 +378,3 @@ int main(int argc, char *argv[])
 
     return 0;
 }
-

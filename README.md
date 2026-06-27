@@ -12,6 +12,7 @@
 - 2026-06-25：完成 Modbus RTU 主站模块 (CRC16/0x03请求/响应解析/8个测试案例)
 - 2026-06-26：完成 STM32F407 Modbus 从机开发 + RS485 真实通讯联调
 - 2026-06-26：经过 3 轮迭代 (Polling→中断→DMA+IDLE) 实现稳定通讯，2700+ 轮无异常
+- 2026-06-27：完成阶段3前半部分——多线程数据管线架构 (pthread) 和告警处理模块
 
 ## 当前 Demo 功能
 
@@ -32,6 +33,12 @@
   - 三重 echo 消除机制
 - 主循环周期 Modbus 采集：串口可用时自动走 Modbus 采集，失败/超时时自动 fallback 模拟数据
 - 日志标识数据来源：`[modbus]` 真实采集 / `[mock]` 模拟 fallback
+- 多线程数据管线（阶段3）：
+  - collect 线程：周期 Modbus 采集或 mock 数据生成，推入 raw_queue
+  - process 线程：从 raw_queue 拉取样本，数据校验、阈值判断、告警状态计算，推入 store_queue
+  - sample_queue：pthread mutex + condition variable 有界队列，支持超时等待和优雅退出
+  - processor：可配置阈值 (pH/temp/turb/cond)，超限自动触发告警
+- `--test N` 测试模式：无需硬件即可验证完整线程管线
 
 ## 目录结构
 
@@ -43,6 +50,8 @@
       config.h
       logger.h
       sample.h
+      sample_queue.h
+      processor.h
       serial_port.h
       modbus_rtu.h
     src/
@@ -50,6 +59,8 @@
       config.c
       logger.c
       sample.c
+      sample_queue.c
+      processor.c
       serial_port.c
       modbus_rtu.c
   config/
@@ -81,6 +92,36 @@ cd app
 make clean && make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
 scp -O water_gateway root@192.168.2.201:/home/root/
 ssh root@192.168.2.201 "./water_gateway -c gateway.conf"
+```
+
+### 线程管道测试（无需硬件）
+
+```sh
+cd app
+make clean && make
+./water_gateway -c ../config/gateway.conf --test 10
+```
+
+测试模式使用 mock 数据在 2 个线程中运行完整管线，输出队列统计信息。适用于本地 PC 或开发板快速验证。
+
+### 多线程架构
+
+```
+collect_thread                     processor_thread
+    │                                    │
+    │  Modbus/mock → water_sample_t      │
+    │         │                          │
+    │    raw_queue.push()                │
+    │         │                          │
+    │    ─────┼─── raw_queue ────→    pop()
+    │         │                    校验+阈值判断
+    │         │                    告警状态计算
+    │         │                          │
+    │         │                   store_queue.push()
+    │         │                          │
+    │         │              ┌───────────┘
+    │         │              ▼
+    │         │         store_queue (SQLite写入待实现)
 ```
 
 ### STM32 从机
@@ -128,7 +169,7 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   RX: 01 03 0E 02 D5 09 C9 01 31 03 39 00 00 00 00 01 31 30 C6
 ```
 
-## 当前代码状态 (2026-06-26)
+## 当前代码状态 (2026-06-27)
 
 ```
 已实现：
@@ -139,19 +180,21 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   ✅ Modbus RTU 主站 (modbus_rtu.c)
   ✅ STM32F407 Modbus 从机 (DMA+IDLE 中断)
   ✅ RS485 真实通讯联调 (i.MX6ULL ↔ STM32)
-  ✅ Modbus 采集 + mock 自动 fallback 主循环
+  ✅ pthread 有界队列 (sample_queue.c)
+  ✅ 数据处理 + 阈值告警 (processor.c)
+  ✅ 多线程数据管线 (collect + process 线程)
+  ✅ --test N 管道测试模式
   ✅ 交叉编译 + 静态链接 + 开发板运行
 
 待实现：
-  ❌ 多线程架构（阶段 3）
-  ❌ SQLite 缓存
-  ❌ MQTT/TCP 上传
-  ❌ systemd 服务化
-  ❌ GPIO 告警驱动
+  ❌ SQLite 缓存（阶段3后续）
+  ❌ 存储线程和上传线程
+  ❌ MQTT/TCP 上传（阶段4）
+  ❌ systemd 服务化（阶段5）
+  ❌ GPIO 告警驱动（阶段6）
 ```
 
 ## 下一步计划
 
-- 进入阶段 3：多线程架构 (pthread) 和 SQLite 断网缓存
-- 将采集、处理、存储、上传拆分为独立线程
-- 实现断网数据本地存储和网络恢复后补传
+- 接入 SQLite：创建 samples 表、实现存储线程（从 store_queue 拉取数据写入数据库）
+- 实现查询未上传数据接口，为阶段4上传补传做准备

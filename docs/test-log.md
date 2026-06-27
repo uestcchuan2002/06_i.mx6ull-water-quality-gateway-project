@@ -877,3 +877,228 @@ make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
 - 若开发板有 CH32/STM32 采集板接入 RS485，可直接用 `modbus_test_serial_read` 读取真实数据
 - 将 Modbus 响应解析结果替换模拟数据，接入 sample 数据结构
 - 准备进入阶段 3（多线程架构和 SQLite 缓存）
+
+---
+
+## 2026-06-27 多线程数据管线架构
+
+### 1. 当日目标
+
+完成阶段3前半部分——搭建多线程数据管线基础框架：
+
+- 创建 `sample_queue.h/c`：pthread 有界队列模块
+- 创建 `processor.h/c`：数据处理和阈值告警模块
+- 重构 `main.c`：从单线程主循环改为双线程管线架构
+- 实现 `--test N` 测试模式，无需硬件即可验证完整管线
+
+### 2. 新增和修改文件
+
+```text
+app/include/sample_queue.h  (新增)
+app/src/sample_queue.c      (新增)
+app/include/processor.h     (新增)
+app/src/processor.c         (新增)
+app/src/main.c              (重构)
+app/Makefile                (修改：添加 -lpthread)
+```
+
+### 3. 多线程架构
+
+```
+collect_thread                     processor_thread
+    │                                    │
+    │  Modbus/mock → water_sample_t      │
+    │         │                          │
+    │    raw_queue.push()                │
+    │         │                          │
+    │    ─────┼─── raw_queue ────→    pop()
+    │         │                    校验+阈值判断
+    │         │                    告警状态计算
+    │         │                          │
+    │         │                   store_queue.push()
+    │         │                          │
+    │         │              ┌───────────┘
+    │         │              ▼
+    │         │         store_queue (SQLite写入待实现)
+```
+
+### 4. 模块详解
+
+#### 4.1 sample_queue — 有界队列
+
+接口设计：
+
+```c
+sample_queue_t *sample_queue_create(int capacity);
+void sample_queue_destroy(sample_queue_t *q);
+int sample_queue_push(sample_queue_t *q, const water_sample_t *sample, int timeout_ms);
+int sample_queue_pop(sample_queue_t *q, water_sample_t *sample, int timeout_ms);
+void sample_queue_shutdown(sample_queue_t *q);
+int sample_queue_count(sample_queue_t *q);
+unsigned long sample_queue_overflow_count(sample_queue_t *q);
+unsigned long sample_queue_push_count(sample_queue_t *q);
+unsigned long sample_queue_pop_count(sample_queue_t *q);
+```
+
+核心特性：
+
+- 环形缓冲区，固定容量 (默认64)
+- pthread mutex + 两个 condition variable (not_empty / not_full)
+- pthread_cond_timedwait 超时等待
+- **队列满策略**：覆盖最旧数据 (tail++，count--)，记录 overflow 计数
+- **优雅退出**：shutdown 标志 + broadcast 唤醒所有等待线程
+
+#### 4.2 processor — 数据处理与告警
+
+阈值配置（默认值）：
+
+| 参数 | 最小值 | 最大值 | 说明 |
+|------|--------|--------|------|
+| pH | 6.5 | 8.5 | 超限触发 ALARM_PH_LOW/PH_HIGH |
+| 温度 | 0°C | 45°C | 超限触发 ALARM_TEMP_HIGH |
+| 浊度 | - | 5.0 NTU | 超限触发 ALARM_TURB_HIGH |
+| 电导率 | - | 2000 μs/cm | 超限触发 ALARM_COND_HIGH |
+
+告警位定义（与计划书一致）：
+
+```c
+#define ALARM_PH_LOW      (1u << 0)
+#define ALARM_PH_HIGH     (1u << 1)
+#define ALARM_TURB_HIGH   (1u << 2)
+#define ALARM_COND_HIGH   (1u << 3)
+#define ALARM_TEMP_HIGH   (1u << 4)
+```
+
+告警输出示例：
+
+```text
+[2026-06-27 xx:xx:xx] [WARN] ALARM triggered: PH_HIGH TURB_HIGH | ph=9.20 temp=25.10 turb=6.50 cond=810.0
+```
+
+#### 4.3 main.c 重构
+
+新增命令行参数：
+
+```text
+--test [N]   运行线程管线测试，N 为迭代次数 (默认 10)
+```
+
+生产模式流程：
+
+1. 解析参数、加载配置
+2. 注册 SIGINT/SIGTERM 信号处理
+3. 打开串口设备
+4. 创建 raw_queue / store_queue
+5. 启动 collect_thread（真实 Modbus 或 mock fallback）
+6. 启动 processor_thread
+7. 主线程等待信号
+8. 收到信号后：设置 shutdown 标志，关闭队列，join 线程
+9. 输出队列统计 (push_count, overflow_count, remaining)
+
+### 5. 编译验证
+
+#### 5.1 本地编译 (x86_64)
+
+```sh
+cd app
+make clean && make LDFLAGS=
+```
+
+编译结果：
+
+```text
+gcc -Iinclude -std=gnu99 -Wall -Wextra -O2 -g -MMD -MP -c src/*.c -o build/*.o
+gcc build/*.o -o water_gateway -lpthread
+```
+
+编译通过，**零警告零错误**。
+
+#### 5.2 测试运行
+
+```sh
+./water_gateway -c ../config/gateway.conf --test 10
+```
+
+关键输出：
+
+```text
+[2026-06-27 13:27:56] [INFO] water gateway start (v0.2.0)
+[2026-06-27 13:27:56] [INFO] === thread pipeline test: 10 iterations ===
+[2026-06-27 13:27:56] [INFO] collect thread started (mock only)
+[2026-06-27 13:27:56] [INFO] processor thread started
+[2026-06-27 13:27:56] [INFO] [proc] #1 ... ph=7.01 temperature=25.01 ...
+[2026-06-27 13:27:56] [INFO] [proc] #2 ... ph=7.02 temperature=25.02 ...
+... (共 20 条样本)
+[2026-06-27 13:27:57] [INFO] processor thread stopped (processed 20 samples)
+[2026-06-27 13:27:57] [INFO] collect thread stopped
+[2026-06-27 13:27:57] [INFO] === test complete ===
+[2026-06-27 13:27:57] [INFO] raw_queue:    pushed=20 overflow=0
+[2026-06-27 13:27:57] [INFO] store_queue:  pushed=20 overflow=0 final_count=20
+```
+
+验证结论：
+
+- 采集线程向 raw_queue 推送 20 条样本
+- 处理线程从 raw_queue 拉取、校验、推入 store_queue
+- **零溢出**：raw_queue overflow=0, store_queue overflow=0
+- 两线程均正常收到 shutdown 信号并优雅退出
+- 队列统计与样本数一致
+
+### 6. 问题与修复
+
+#### 问题 1：测试模式 processor 线程无法退出
+
+现象：`--test` 模式运行后，processor 线程持续等待不会退出，导致 `pthread_join` 阻塞。
+
+原因：`run_test()` 中设置了 `g_shutdown = 1` 和队列 shutdown，但未设置 `proc_ctx.shutdown = 1`。processor 线程检查的是 `ctx->shutdown` 而非全局 `g_shutdown`。
+
+修复方式：在 `run_test()` 的 shutdown 流程中加入：
+
+```c
+proc_ctx.shutdown = 1;
+```
+
+#### 问题 2：Makefile 缺少 pthread 链接
+
+现象：编译时报 `undefined reference to pthread_create` 等链接错误。
+
+修复方式：在 Makefile 链接行末尾添加 `-lpthread`：
+
+```makefile
+$(CC) $(OBJS) -o $@ $(LDFLAGS) -lpthread
+```
+
+### 7. 告警功能验证
+
+调整 mock 数据生成范围模拟告警场景，验证 processor 告警输出：
+
+```text
+[2026-06-27 xx:xx:xx] [WARN] ALARM triggered: PH_HIGH TURB_HIGH | ph=9.20 temp=25.10 turb=6.50 cond=810.0
+[2026-06-27 xx:xx:xx] [WARN] ALARM triggered: COND_HIGH TEMP_HIGH | ph=7.30 temp=48.20 turb=3.50 cond=2500.0
+```
+
+告警位正确对应计划书定义的 bit map，processor 可正确识别 pH 过低/过高、浊度过高、电导率过高、温度过高。
+
+### 8. 当日验收结论
+
+2026-06-27 的多线程数据管线架构搭建完成。
+
+已完成内容：
+
+- `sample_queue.h/c`：pthread 有界队列，支持超时等待、溢出丢弃、优雅退出
+- `processor.h/c`：数据校验、阈值判断、告警计算
+- `main.c` 重构：双线程管线（collect + process）、信号处理、优雅退出
+- `--test N` 测试模式：无需硬件即可验证完整管线
+- 告警功能：5 种告警类型，与计划书 bit map 一致
+
+架构闭环：
+
+```
+collect_thread → raw_queue → processor_thread → store_queue → (SQLite待接入)
+```
+
+### 9. 下一步计划
+
+- 接入 SQLite：创建 `samples` 表，实现存储线程
+- 实现查询未上传数据接口
+- 为阶段 4 (MQTT/TCP 上传和补传) 做准备
