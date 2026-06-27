@@ -18,6 +18,13 @@ typedef struct {
     int modbus_slave_addr;
     char db_path[256];
     int max_cache_count;
+    int upload_enabled;
+    char upload_protocol[16];
+    char upload_server_host[128];
+    int upload_server_port;
+    int upload_period_ms;
+    int upload_batch_max;
+    int upload_retry_max;
 } gateway_config_t;
 
 

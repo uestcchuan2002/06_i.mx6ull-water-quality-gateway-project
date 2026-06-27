@@ -14,6 +14,7 @@
 - 2026-06-26：经过 3 轮迭代 (Polling→中断→DMA+IDLE) 实现稳定通讯，2700+ 轮无异常
 - 2026-06-27：完成阶段3前半部分——多线程数据管线架构 (pthread) 和告警处理模块
 - 2026-06-27：完成阶段3后半部分——SQLite 存储模块和存储线程 (3线程完整管线)
+- 2026-06-27：完成阶段4——TCP 上传线程、JSON 序列化、断网补传、SIGPIPE 优雅处理
 
 ## 当前 Demo 功能
 
@@ -49,6 +50,15 @@
   - store 线程：从 store_queue 拉取，批量写入 + 定期 trim
   - 优雅退出：shutdown 时排空队列后关闭数据库
   - 查询接口：`get_unuploaded_count` / `get_total_count`
+- TCP 上传模块（阶段4）：
+  - upload 线程：4 线程完整管线 (collect → process → store → upload)
+  - JSON 序列化：按协议格式打包水质数据
+  - TCP 连接管理：自动重连、优雅断线恢复
+  - 补传机制：启机时/定时查询 uploaded=0 记录批量上传
+  - shutdown 排空：退出前清空所有未上传记录
+  - 重试管理：失败记录 upload_retry 递增，超阈值跳过
+  - 服务端断开不崩溃：SIGPIPE 信号忽略 + MSG_NOSIGNAL
+  - --test 模式支持完整 4 线程上传测试
 
 ## 目录结构
 
@@ -65,6 +75,7 @@
       serial_port.h
       modbus_rtu.h
       sqlite_store.h
+      uploader.h
     src/
       main.c
       config.c
@@ -75,12 +86,14 @@
       serial_port.c
       modbus_rtu.c
       sqlite_store.c
+      uploader.c
   config/
     gateway.conf
   docs/
     test-log.md
   driver/
   scripts/
+    run_receiver.py              (TCP 上传测试接收端)
 
 Slave/                              (STM32F407 Modbus 从机工程)
   USER/
@@ -128,31 +141,55 @@ make clean && make
 ./water_gateway -c ../config/gateway.conf --test 10
 ```
 
-测试模式使用 mock 数据在 2 个线程中运行完整管线，输出队列统计信息。适用于本地 PC 或开发板快速验证。
+测试模式使用 mock 数据在 4 个线程中运行完整管线，输出队列和上传统计信息。适用于本地 PC 或开发板快速验证。
+
+### 上传测试（需两个终端）
+
+```sh
+# 终端 1：启动 TCP 接收端
+cd scripts
+python3 run_receiver.py --port 18800
+
+# 终端 2：启动网关（接收端在 Ubuntu 则改 config 中 upload_server_host 为 Ubuntu IP）
+cd app
+make clean && make
+./water_gateway -c ../config/gateway.conf
+```
+
+接收端会实时打印每条收到的 JSON 记录，网关停机后接收端自动等待重连。
 
 ### 多线程架构
 
 ```
-collect_thread          processor_thread          store_thread
-    │                         │                        │
-    │ Modbus/mock →          │                        │
-    │ water_sample_t         │                        │
-    │      │                  │                        │
-    │ raw_queue.push()       │                        │
-    │      │                  │                        │
-    │  ────┼── raw_queue ─→ pop()                      │
-    │      │             校验+阈值判断                   │
-    │      │             告警状态计算                    │
-    │      │                  │                        │
-    │      │          store_queue.push()               │
-    │      │                  │                        │
-    │      │          ────────┼── store_queue ──→   pop()
-    │      │                  │                 SQLite INSERT
-    │      │                  │                 缓存裁剪(每100条)
-    │      │                  │                        │
-    │      │                  │              ┌─────────┘
-    │      │                  │              ▼
-    │      │                  │           water_gateway.db
+collect_thread       processor_thread        store_thread         upload_thread
+     │                      │                      │                     │
+     │ Modbus/mock →       │                      │                     │
+     │ water_sample_t      │                      │                     │
+     │      │               │                      │                     │
+     │ raw_queue.push()    │                      │                     │
+     │      │               │                      │                     │
+     │  ────┼── raw_queue → pop()                  │                     │
+     │      │           校验+阈值判断               │                     │
+     │      │           告警状态计算                │                     │
+     │      │               │                      │                     │
+     │      │       store_queue.push()             │                     │
+     │      │               │                      │                     │
+     │      │       ───────┼── store_queue → pop() │                     │
+     │      │               │              SQLite INSERT                │
+     │      │               │              缓存裁剪(每100条)            │
+     │      │               │                      │                     │
+     │      │               │                      └── water_gateway.db  │
+     │      │               │                              ▲              │
+     │      │               │                              │              │
+     │      │               │                    upload_thread poll      │
+     │      │               │                  SELECT WHERE uploaded=0   │
+     │      │               │                          │                 │
+     │      │               │                    JSON 序列化              │
+     │      │               │                      TCP send              │
+     │      │               │                          │                 │
+     │      │               │                  ┌───────┘                 │
+     │      │               │                  ▼                         │
+     │      │               │           run_receiver.py (TCP server)     │
 ```
 
 ### STM32 从机
@@ -211,6 +248,15 @@ baudrate=9600
 modbus_slave_addr=1
 db_path=water_gateway.db
 max_cache_count=100000
+
+# upload config
+upload_enabled=1
+upload_protocol=tcp
+upload_server_host=192.168.2.150
+upload_server_port=18800
+upload_period_ms=5000
+upload_batch_max=20
+upload_retry_max=3
 ```
 
 ## 硬件连接
@@ -255,15 +301,18 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   ✅ 交叉编译 + 静态链接 + 开发板运行
   ✅ SQLite 存储模块 (sqlite_store.c) - 建表/插入/查询/标记上传/缓存裁剪
   ✅ 存储线程 - 3 线程完整管线 (collect → process → store)
+  ✅ TCP 上传模块 (uploader.c) - JSON 序列化/TCP 发送/自动重连/补传/排空
+  ✅ upload 线程 - 4 线程完整管线 (collect → process → store → upload)
+  ✅ 接收端测试脚本 (run_receiver.py) - 支持多轮重连、累计计数
+  ✅ SIGPIPE 信号处理 - 服务端断开网关不崩溃
 
 待实现：
-  ❌ 上传线程和 MQTT/TCP 上传（阶段4）
   ❌ systemd 服务化（阶段5）
   ❌ GPIO 告警驱动（阶段6）
 ```
 
 ## 下一步计划
 
-- 进入阶段4：实现 upload 线程，MQTT/TCP 数据上传
-- 实现 JSON 打包和上传失败保留
-- 补传机制：从 SQLite 查询 uploaded=0 的记录批量上传
+- 进入阶段5：systemd 服务化，开机自启，SIGTERM 优雅退出
+- 进入阶段6：GPIO 告警字符设备驱动
+- 可选：MQTT 上传后端（当前 TCP 架构预留了 upload_protocol 扩展点）

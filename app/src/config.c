@@ -57,6 +57,13 @@ void config_set_default(gateway_config_t *cfg)
     cfg->modbus_slave_addr = 1;
     copy_string(cfg->db_path, sizeof(cfg->db_path), "water_gateway.db");
     cfg->max_cache_count = 100000;
+    cfg->upload_enabled = 1;
+    copy_string(cfg->upload_protocol, sizeof(cfg->upload_protocol), "tcp");
+    copy_string(cfg->upload_server_host, sizeof(cfg->upload_server_host), "192.168.2.150");
+    cfg->upload_server_port = 18800;
+    cfg->upload_period_ms = 5000;
+    cfg->upload_batch_max = 20;
+    cfg->upload_retry_max = 3;
 }
 
 int config_load(const char *path, gateway_config_t *cfg)
@@ -118,6 +125,20 @@ int config_load(const char *path, gateway_config_t *cfg)
             copy_string(cfg->db_path, sizeof(cfg->db_path), value);
         } else if (strcmp(key, "max_cache_count") == 0) {
             cfg->max_cache_count = atoi(value);
+        } else if (strcmp(key, "upload_enabled") == 0) {
+            cfg->upload_enabled = atoi(value);
+        } else if (strcmp(key, "upload_protocol") == 0) {
+            copy_string(cfg->upload_protocol, sizeof(cfg->upload_protocol), value);
+        } else if (strcmp(key, "upload_server_host") == 0) {
+            copy_string(cfg->upload_server_host, sizeof(cfg->upload_server_host), value);
+        } else if (strcmp(key, "upload_server_port") == 0) {
+            cfg->upload_server_port = atoi(value);
+        } else if (strcmp(key, "upload_period_ms") == 0) {
+            cfg->upload_period_ms = atoi(value);
+        } else if (strcmp(key, "upload_batch_max") == 0) {
+            cfg->upload_batch_max = atoi(value);
+        } else if (strcmp(key, "upload_retry_max") == 0) {
+            cfg->upload_retry_max = atoi(value);
         } else {
             fprintf(stderr, "unknown config key at line %d: %s\n", line_no, key);
         }
@@ -162,6 +183,13 @@ void config_print(const gateway_config_t *cfg)
     printf("  modbus_slave_addr= %d\n", cfg->modbus_slave_addr);
     printf("  db_path         = %s\n", cfg->db_path);
     printf("  max_cache_count = %d\n", cfg->max_cache_count);
+    printf("  upload_enabled  = %d\n", cfg->upload_enabled);
+    printf("  upload_protocol = %s\n", cfg->upload_protocol);
+    printf("  upload_server_host = %s\n", cfg->upload_server_host);
+    printf("  upload_server_port = %d\n", cfg->upload_server_port);
+    printf("  upload_period_ms   = %d\n", cfg->upload_period_ms);
+    printf("  upload_batch_max   = %d\n", cfg->upload_batch_max);
+    printf("  upload_retry_max   = %d\n", cfg->upload_retry_max);
 }
 
 

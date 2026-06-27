@@ -17,9 +17,10 @@
 #include "../include/sample_queue.h"
 #include "../include/serial_port.h"
 #include "../include/sqlite_store.h"
+#include "../include/uploader.h"
 
 #define DEFAULT_CONFIG_PATH "../config/gateway.conf"
-#define WATER_GATEWAY_VERSION "0.3.0"
+#define WATER_GATEWAY_VERSION "0.4.0"
 #define DEFAULT_QUEUE_CAPACITY 64
 #define DEFAULT_TEST_ITERATIONS 10
 
@@ -156,14 +157,18 @@ static int run_test(int iterations)
     collect_ctx_t collect_ctx;
     processor_ctx_t proc_ctx;
     sqlite_store_ctx_t store_ctx;
+    uploader_ctx_t upload_ctx;
     sqlite3 *db = NULL;
     pthread_t collect_tid;
     pthread_t proc_tid;
     pthread_t store_tid;
+    pthread_t upload_tid;
     int i;
 
     config_set_default(&cfg);
     cfg.sample_period_ms = 50;
+    cfg.upload_period_ms = 200;
+    cfg.upload_batch_max = 100;
 
     log_info("=== thread pipeline test: %d iterations ===", iterations);
 
@@ -245,6 +250,20 @@ static int run_test(int iterations)
         return 1;
     }
 
+    memset(&upload_ctx, 0, sizeof(upload_ctx));
+    upload_ctx.db = db;
+    upload_ctx.device_id = cfg.device_id;
+    upload_ctx.server_host = cfg.upload_server_host;
+    upload_ctx.server_port = cfg.upload_server_port;
+    upload_ctx.upload_period_ms = cfg.upload_period_ms;
+    upload_ctx.upload_batch_max = cfg.upload_batch_max;
+    upload_ctx.upload_retry_max = cfg.upload_retry_max;
+    upload_ctx.shutdown = 0;
+
+    if (pthread_create(&upload_tid, NULL, uploader_thread, &upload_ctx) != 0) {
+        log_error("failed to create upload thread");
+    }
+
     for (i = 0; i < iterations; i++) {
         sleep_ms(100);
     }
@@ -252,12 +271,14 @@ static int run_test(int iterations)
     g_shutdown = 1;
     proc_ctx.shutdown = 1;
     store_ctx.shutdown = 1;
+    upload_ctx.shutdown = 1;
     sample_queue_shutdown(raw_queue);
     sample_queue_shutdown(store_queue);
 
     pthread_join(collect_tid, NULL);
     pthread_join(proc_tid, NULL);
     pthread_join(store_tid, NULL);
+    pthread_join(upload_tid, NULL);
 
     log_info("=== test complete ===");
     log_info("raw_queue:    pushed=%lu overflow=%lu",
@@ -272,6 +293,8 @@ static int run_test(int iterations)
     log_info("db:           total_samples=%d unuploaded=%d",
              sqlite_store_get_total_count(db),
              sqlite_store_get_unuploaded_count(db));
+    log_info("upload_thread: uploaded=%lu failed=%lu",
+             upload_ctx.uploaded_count, upload_ctx.failed_count);
 
     sqlite_store_close(db);
     sample_queue_destroy(raw_queue);
@@ -333,6 +356,11 @@ int main(int argc, char *argv[])
     log_info("modbus_slave_addr=%d", cfg.modbus_slave_addr);
     log_info("db_path=%s", cfg.db_path);
     log_info("max_cache_count=%d", cfg.max_cache_count);
+    log_info("upload_enabled=%d", cfg.upload_enabled);
+    log_info("upload_protocol=%s", cfg.upload_protocol);
+    log_info("upload_server=%s:%d", cfg.upload_server_host, cfg.upload_server_port);
+    log_info("upload_period_ms=%d batch=%d retry=%d",
+             cfg.upload_period_ms, cfg.upload_batch_max, cfg.upload_retry_max);
 
     if (test_iterations > 0) {
         return run_test(test_iterations);
@@ -340,6 +368,7 @@ int main(int argc, char *argv[])
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     fd = serial_open(cfg.serial_device, cfg.baudrate);
     if (fd < 0) {
@@ -355,10 +384,12 @@ int main(int argc, char *argv[])
         collect_ctx_t collect_ctx;
         processor_ctx_t proc_ctx;
         sqlite_store_ctx_t store_ctx;
+        uploader_ctx_t upload_ctx;
         sqlite3 *db = NULL;
         pthread_t collect_tid;
         pthread_t proc_tid;
         pthread_t store_tid;
+        pthread_t upload_tid;
 
         raw_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
         store_queue = sample_queue_create(DEFAULT_QUEUE_CAPACITY);
@@ -442,6 +473,35 @@ int main(int argc, char *argv[])
             return 1;
         }
 
+        memset(&upload_ctx, 0, sizeof(upload_ctx));
+        upload_ctx.db = db;
+        upload_ctx.device_id = cfg.device_id;
+        upload_ctx.server_host = cfg.upload_server_host;
+        upload_ctx.server_port = cfg.upload_server_port;
+        upload_ctx.upload_period_ms = cfg.upload_period_ms;
+        upload_ctx.upload_batch_max = cfg.upload_batch_max;
+        upload_ctx.upload_retry_max = cfg.upload_retry_max;
+        upload_ctx.shutdown = 0;
+
+        if (cfg.upload_enabled) {
+            if (pthread_create(&upload_tid, NULL, uploader_thread, &upload_ctx) != 0) {
+                log_error("failed to create upload thread");
+                g_shutdown = 1;
+                proc_ctx.shutdown = 1;
+                store_ctx.shutdown = 1;
+                sample_queue_shutdown(raw_queue);
+                sample_queue_shutdown(store_queue);
+                pthread_join(collect_tid, NULL);
+                pthread_join(proc_tid, NULL);
+                pthread_join(store_tid, NULL);
+                sqlite_store_close(db);
+                sample_queue_destroy(raw_queue);
+                sample_queue_destroy(store_queue);
+                if (fd >= 0) serial_close(fd);
+                return 1;
+            }
+        }
+
         while (!g_shutdown) {
             sleep_ms(200);
         }
@@ -455,6 +515,11 @@ int main(int argc, char *argv[])
         pthread_join(collect_tid, NULL);
         pthread_join(proc_tid, NULL);
         pthread_join(store_tid, NULL);
+
+        upload_ctx.shutdown = 1;
+        if (cfg.upload_enabled) {
+            pthread_join(upload_tid, NULL);
+        }
 
         log_info("=== pipeline stopped ===");
         log_info("raw_queue:    pushed=%lu overflow=%lu remaining=%d",
@@ -470,6 +535,8 @@ int main(int argc, char *argv[])
         log_info("db:            total_samples=%d unuploaded=%d",
                  sqlite_store_get_total_count(db),
                  sqlite_store_get_unuploaded_count(db));
+        log_info("upload_thread: uploaded=%lu failed=%lu",
+                 upload_ctx.uploaded_count, upload_ctx.failed_count);
 
         sqlite_store_close(db);
         sample_queue_destroy(raw_queue);

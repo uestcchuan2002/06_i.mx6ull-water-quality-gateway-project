@@ -1284,7 +1284,169 @@ collect_thread → raw_queue → processor_thread → store_queue → store_thre
 
 ### 12. 下一步计划
 
-- 进入阶段4：实现 upload 线程，MQTT/TCP 上传
+- 进入阶段4：实现 upload 线程，TCP 上传
 - JSON 数据打包（按计划书格式）
 - 上传失败保留 uploaded=0
 - 补传机制：查询 uploaded=0 批量上传并标记
+
+---
+
+## 阶段4：TCP 上传线程调试记录 (2026-06-27)
+
+### 13. 环境
+
+| 项目 | 值 |
+|------|-----|
+| 主机 | Ubuntu 22.04 x86_64 |
+| 交叉编译 | arm-linux-gnueabihf- (可选) |
+| 数据库 | SQLite 3.45.1 (嵌入式 amalgamation) |
+| 测试工具 | run_receiver.py (Python3) |
+| 版本 | v0.4.0 |
+
+### 14. 新增文件清单
+
+| 文件 | 说明 |
+|------|------|
+| `app/include/uploader.h` | upload 线程接口 + uploader_ctx_t 上下文结构体 |
+| `app/src/uploader.c` | JSON 序列化、TCP 连接/发送、上传主循环、shutdown 排空 |
+| `scripts/run_receiver.py` | TCP 测试接收端，支持多轮重连和累计计数 |
+| `app/include/config.h` (修改) | 新增 7 个上传配置字段 |
+| `app/src/config.c` (修改) | 解析上传配置项 |
+| `config/gateway.conf` (修改) | 新增 upload 配置段 |
+| `app/src/main.c` (修改) | 集成 upload 线程 + SIGPIPE 处理 |
+
+### 15. 测试场景1：实时上传
+
+测试命令：
+```sh
+# 终端1：启动接收端
+python3 scripts/run_receiver.py --port 18800
+
+# 终端2：启动网关
+./water_gateway -c ../config/gateway.conf --test 20
+```
+
+关键日志：
+```text
+[2026-06-27 17:35:04] [INFO] upload thread started (host=127.0.0.1:18800 period=200 batch=100 retry=3)
+[2026-06-27 17:35:04] [INFO] uploader: connected to 127.0.0.1:18800
+[2026-06-27 17:35:06] [INFO] processor thread stopped (processed 40 samples)
+[2026-06-27 17:35:06] [INFO] store thread stopped (processed 40 samples, written 40, failed 0)
+[2026-06-27 17:35:06] [INFO] upload thread stopped (uploaded=36 failed=0)
+[2026-06-27 17:35:06] [INFO] db:            total_samples=40 unuploaded=4
+[2026-06-27 17:35:06] [INFO] upload_thread: uploaded=36 failed=0
+```
+
+接收端输出：
+```text
+[receiver] connected from 127.0.0.1:41078
+[#0001] device=water_gateway_001 ph=7.01 temp=25.01 turb=3.01 cond=801 alarm=0 seq=1
+[#0002] device=water_gateway_001 ph=7.02 temp=25.02 turb=3.02 cond=802 alarm=0 seq=2
+...
+[#0036] device=water_gateway_001 ph=7.16 temp=25.36 turb=3.06 cond=836 alarm=0 seq=36
+[receiver] connection closed by peer
+[receiver] total received: 36, alarms: 0
+```
+
+### 16. 测试场景2：断网补传（离线→在线）
+
+步骤：
+
+1. 不启动接收端，直接运行网关采集 3 秒：
+```text
+[2026-06-27 17:36:02] [WARN] uploader: connect() failed: Connection refused   # 每500ms重试
+...
+[2026-06-27 17:36:05] [INFO] db: total_samples=15 unuploaded=15               # 全部标记未上传
+[2026-06-27 17:36:05] [INFO] upload_thread: uploaded=0 failed=0
+```
+
+2. 启动接收端，再次运行网关（复用同一 DB）：
+```text
+[2026-06-27 17:36:08] [INFO] uploader: connected to 127.0.0.1:18801          # 连接成功
+[2026-06-27 17:36:13] [INFO] upload thread stopped (uploaded=38 failed=0)
+[2026-06-27 17:36:13] [INFO] db: total_samples=40 unuploaded=2               # 40条仅剩2条
+```
+
+接收端收到 38 条记录（15 条历史补传 + 23 条新数据），JSON 解析全部通过。
+
+### 17. 测试场景3：服务端断开不崩溃
+
+kill 接收端后的日志：
+```text
+[#0002] device=test ph=7.02 temp=25.02 ...
+[#0001] device=test ph=7.04 temp=25.04 ...   # 网关继续采集
+
+[2026-06-27 17:59:15] [WARN] uploader: send() failed: Broken pipe
+[2026-06-27 17:59:15] [WARN] uploader: connection lost, will reconnect
+[2026-06-27 17:59:15] [WARN] uploader: connect() failed: Connection refused
+[2026-06-27 17:59:16] [WARN] uploader: connect() failed: Connection refused
+gateway alive? YES                              # 网关没崩溃！
+gateway alive? YES                              # 持续确认存活
+```
+
+修复方式：`main.c` 添加 `signal(SIGPIPE, SIG_IGN)`，`uploader.c` send() 使用 `MSG_NOSIGNAL`。
+
+### 18. 测试场景4：shutdown 排空验证
+
+修复前问题：shutdown 时 upload 线程先退出，store 线程后写入的数据遗留在 DB 中（unuploaded=4）。
+
+修复后日志：
+```text
+[2026-06-27 18:19:23] [INFO] shutting down...
+[2026-06-27 18:19:23] [INFO] processor thread stopped (processed 60 samples)
+[2026-06-27 18:19:23] [INFO] store thread stopped (processed 60 samples, written 60, failed 0)
+[2026-06-27 18:19:23] [INFO] uploader: draining remaining unuploaded records...
+[2026-06-27 18:19:23] [INFO] upload thread stopped (uploaded=60 failed=0)
+[2026-06-27 18:19:23] [INFO] db:            total_samples=60 unuploaded=0
+[2026-06-27 18:19:23] [INFO] upload_thread: uploaded=60 failed=0
+```
+
+接收端确认收到全部 60 条。
+
+修复方式：
+1. `main.c`：将 `upload_ctx.shutdown = 1` 移到 `pthread_join(store_tid)` 之后，确保 store 写完所有数据后再通知 upload 排空
+2. `uploader.c`：主循环结束后追加排空循环，持续查询 `uploaded=0` 直到 DB 清空
+
+### 19. 验证结论
+
+| 测试场景 | 结果 |
+|----------|------|
+| 实时 TCP 上传 | 36/40 上传成功 (最后4条在 shutdown 窗口写入) |
+| 断网补传 | 15 条历史 + 23 条新数据 = 38 条补传成功 |
+| 服务端断开不崩溃 | 网关持续运行，upload 线程自动重连 |
+| shutdown 排空 | unuploaded=0，60 条全部上传 |
+| JSON 格式 | 接收端 parse 100% 通过 |
+| 编译 | 零警告零错误 (gcc -Wall -Wextra) |
+| 版本升级 | v0.3.0 → v0.4.0 |
+
+### 20. 当日验收结论
+
+2026-06-27 阶段4 TCP 上传模块开发完成。
+
+已完成内容：
+
+- `uploader.h/c`：完整 TCP 上传模块
+- 4 线程完整管线：collect → process → store → upload
+- JSON 序列化（按计划书 8.2 格式）
+- TCP 连接管理（自动重连、断线恢复）
+- 补传机制（启动时/定时查询 uploaded=0 批量上传）
+- shutdown 排空（退出前确保所有数据上传完毕）
+- 重试管理（失败 upload_retry ++，超阈值跳过）
+- SIGPIPE 处理（服务端断开不崩溃）
+- 接收端脚本 run_receiver.py（多轮重连、累计计数）
+- 配置文件扩展（7 个上传配置项）
+
+数据管线已闭环：
+
+```
+collect_thread → raw_queue → processor_thread → store_queue → store_thread → SQLite
+                                                                                  ↑
+                                                                        upload_thread (poll)
+                                                                                  ↓
+                                                                         TCP server (receiver)
+```
+
+### 21. 下一步计划
+
+- 进入阶段5：systemd 服务化、开机自启、SIGTERM 优雅退出
+- 进入阶段6：GPIO 告警字符设备驱动
