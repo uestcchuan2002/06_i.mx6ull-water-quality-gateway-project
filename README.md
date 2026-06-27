@@ -13,6 +13,7 @@
 - 2026-06-26：完成 STM32F407 Modbus 从机开发 + RS485 真实通讯联调
 - 2026-06-26：经过 3 轮迭代 (Polling→中断→DMA+IDLE) 实现稳定通讯，2700+ 轮无异常
 - 2026-06-27：完成阶段3前半部分——多线程数据管线架构 (pthread) 和告警处理模块
+- 2026-06-27：完成阶段3后半部分——SQLite 存储模块和存储线程 (3线程完整管线)
 
 ## 当前 Demo 功能
 
@@ -39,6 +40,15 @@
   - sample_queue：pthread mutex + condition variable 有界队列，支持超时等待和优雅退出
   - processor：可配置阈值 (pH/temp/turb/cond)，超限自动触发告警
 - `--test N` 测试模式：无需硬件即可验证完整线程管线
+- SQLite 存储模块（阶段3）：
+  - `samples` 表：12 字段 (id/device_id/timestamp_ms/ph/temperature/turbidity/conductivity/sensor_status/alarm_status/sequence/uploaded/upload_retry/created_at)
+  - 绑定参数化插入，WAL 模式 + NORMAL 同步
+  - `uploaded` 索引和 `timestamp_ms` 索引
+  - 上传状态标记 (`mark_uploaded`)、重试计数 (`inc_retry`)
+  - 缓存裁剪 (`trim_cache`)：优先删除已上传旧数据，超出上限强制清理
+  - store 线程：从 store_queue 拉取，批量写入 + 定期 trim
+  - 优雅退出：shutdown 时排空队列后关闭数据库
+  - 查询接口：`get_unuploaded_count` / `get_total_count`
 
 ## 目录结构
 
@@ -54,6 +64,7 @@
       processor.h
       serial_port.h
       modbus_rtu.h
+      sqlite_store.h
     src/
       main.c
       config.c
@@ -63,6 +74,7 @@
       processor.c
       serial_port.c
       modbus_rtu.c
+      sqlite_store.c
   config/
     gateway.conf
   docs/
@@ -84,6 +96,20 @@ Slave/                              (STM32F407 Modbus 从机工程)
 ```
 
 ## 编译和运行
+
+### 编译依赖
+
+编译前需安装以下开发库：
+
+```sh
+# Debian/Ubuntu
+sudo apt-get install -y libsqlite3-dev
+
+# CentOS/RHEL/Fedora
+sudo yum install -y sqlite-devel
+```
+
+交叉编译 ARM 版本同理，需确保交叉编译工具链中包含 sqlite3 库（头文件位于工具链 sysroot 的 `/usr/include/sqlite3.h`）。
 
 ### Linux 网关
 
@@ -107,21 +133,26 @@ make clean && make
 ### 多线程架构
 
 ```
-collect_thread                     processor_thread
-    │                                    │
-    │  Modbus/mock → water_sample_t      │
-    │         │                          │
-    │    raw_queue.push()                │
-    │         │                          │
-    │    ─────┼─── raw_queue ────→    pop()
-    │         │                    校验+阈值判断
-    │         │                    告警状态计算
-    │         │                          │
-    │         │                   store_queue.push()
-    │         │                          │
-    │         │              ┌───────────┘
-    │         │              ▼
-    │         │         store_queue (SQLite写入待实现)
+collect_thread          processor_thread          store_thread
+    │                         │                        │
+    │ Modbus/mock →          │                        │
+    │ water_sample_t         │                        │
+    │      │                  │                        │
+    │ raw_queue.push()       │                        │
+    │      │                  │                        │
+    │  ────┼── raw_queue ─→ pop()                      │
+    │      │             校验+阈值判断                   │
+    │      │             告警状态计算                    │
+    │      │                  │                        │
+    │      │          store_queue.push()               │
+    │      │                  │                        │
+    │      │          ────────┼── store_queue ──→   pop()
+    │      │                  │                 SQLite INSERT
+    │      │                  │                 缓存裁剪(每100条)
+    │      │                  │                        │
+    │      │                  │              ┌─────────┘
+    │      │                  │              ▼
+    │      │                  │           water_gateway.db
 ```
 
 ### STM32 从机
@@ -134,6 +165,41 @@ collect_thread                     processor_thread
 
 Include paths 需添加：`SYSTEM/usart3`、`HARDWARE/WQSENSOR`
 
+## SQLite 数据库
+
+### 表结构
+
+```sql
+CREATE TABLE IF NOT EXISTS samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id TEXT NOT NULL,
+    timestamp_ms INTEGER NOT NULL,
+    ph REAL NOT NULL,
+    temperature REAL NOT NULL,
+    turbidity REAL NOT NULL,
+    conductivity REAL NOT NULL,
+    sensor_status INTEGER NOT NULL,
+    alarm_status INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,
+    uploaded INTEGER NOT NULL DEFAULT 0,
+    upload_retry INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### 接口
+
+| 函数 | 说明 |
+|------|------|
+| `sqlite_store_open` | 打开/创建数据库 (WAL + NORMAL同步) |
+| `sqlite_store_create_table` | 建表 + 创建 uploaded/timestamp_ms 索引 |
+| `sqlite_store_insert` | 绑定参数化插入一条采样记录 |
+| `sqlite_store_get_unuploaded_count` | 查询未上传记录数 |
+| `sqlite_store_get_total_count` | 查询总记录数 |
+| `sqlite_store_mark_uploaded(id)` | 标记某条记录已上传 |
+| `sqlite_store_inc_retry(id)` | 上传重试计数 +1 |
+| `sqlite_store_trim_cache(max)` | 超上限时优先删除已上传旧数据 |
+
 ## 配置文件
 
 ```ini
@@ -143,6 +209,8 @@ log_level=info
 serial_device=/dev/ttymxc2
 baudrate=9600
 modbus_slave_addr=1
+db_path=water_gateway.db
+max_cache_count=100000
 ```
 
 ## 硬件连接
@@ -185,16 +253,17 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   ✅ 多线程数据管线 (collect + process 线程)
   ✅ --test N 管道测试模式
   ✅ 交叉编译 + 静态链接 + 开发板运行
+  ✅ SQLite 存储模块 (sqlite_store.c) - 建表/插入/查询/标记上传/缓存裁剪
+  ✅ 存储线程 - 3 线程完整管线 (collect → process → store)
 
 待实现：
-  ❌ SQLite 缓存（阶段3后续）
-  ❌ 存储线程和上传线程
-  ❌ MQTT/TCP 上传（阶段4）
+  ❌ 上传线程和 MQTT/TCP 上传（阶段4）
   ❌ systemd 服务化（阶段5）
   ❌ GPIO 告警驱动（阶段6）
 ```
 
 ## 下一步计划
 
-- 接入 SQLite：创建 samples 表、实现存储线程（从 store_queue 拉取数据写入数据库）
-- 实现查询未上传数据接口，为阶段4上传补传做准备
+- 进入阶段4：实现 upload 线程，MQTT/TCP 数据上传
+- 实现 JSON 打包和上传失败保留
+- 补传机制：从 SQLite 查询 uploaded=0 的记录批量上传
