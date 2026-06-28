@@ -10,6 +10,8 @@ typedef enum {
 
 void logger_init(const char *level);
 void logger_set_level(log_level_t level);
+void logger_open_log_file(const char *path);
+void logger_close_log_file(void);
 void logger_log(log_level_t level, const char *fmt, ...);
 
 #define log_debug(...) logger_log(LOG_LEVEL_DEBUG, __VA_ARGS__)

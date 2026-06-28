@@ -361,6 +361,7 @@ int main(int argc, char *argv[])
     log_info("upload_server=%s:%d", cfg.upload_server_host, cfg.upload_server_port);
     log_info("upload_period_ms=%d batch=%d retry=%d",
              cfg.upload_period_ms, cfg.upload_batch_max, cfg.upload_retry_max);
+    log_info("log_file=%s", cfg.log_file);
 
     if (test_iterations > 0) {
         return run_test(test_iterations);
@@ -369,6 +370,8 @@ int main(int argc, char *argv[])
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    logger_open_log_file(cfg.log_file);
 
     fd = serial_open(cfg.serial_device, cfg.baudrate);
     if (fd < 0) {
@@ -502,8 +505,25 @@ int main(int argc, char *argv[])
             }
         }
 
-        while (!g_shutdown) {
-            sleep_ms(200);
+        log_info("pid=%d", (int)getpid());
+
+        {
+            int heartbeat_count = 0;
+
+            while (!g_shutdown) {
+                sleep_ms(1000);
+                heartbeat_count++;
+
+                if (heartbeat_count % 60 == 0) {
+                    log_info("heartbeat: db_total=%d db_unuploaded=%d "
+                             "store_written=%lu store_failed=%lu "
+                             "uploaded=%lu upload_failed=%lu",
+                             sqlite_store_get_total_count(db),
+                             sqlite_store_get_unuploaded_count(db),
+                             store_ctx.write_count, store_ctx.write_fail_count,
+                             upload_ctx.uploaded_count, upload_ctx.failed_count);
+                }
+            }
         }
 
         log_info("shutting down...");
@@ -546,6 +566,8 @@ int main(int argc, char *argv[])
     if (fd >= 0) {
         serial_close(fd);
     }
+
+    logger_close_log_file();
 
     return 0;
 }

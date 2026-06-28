@@ -14,7 +14,7 @@
 - 2026-06-26：经过 3 轮迭代 (Polling→中断→DMA+IDLE) 实现稳定通讯，2700+ 轮无异常
 - 2026-06-27：完成阶段3前半部分——多线程数据管线架构 (pthread) 和告警处理模块
 - 2026-06-27：完成阶段3后半部分——SQLite 存储模块和存储线程 (3线程完整管线)
-- 2026-06-27：完成阶段4——TCP 上传线程、JSON 序列化、断网补传、SIGPIPE 优雅处理
+- 2026-06-28：完成阶段5——sysvinit init.d 脚本、部署安装、开发板全功能验证 (start/stop/restart/status/SIGTERM/自启/崩溃恢复)
 
 ## 当前 Demo 功能
 
@@ -59,6 +59,12 @@
   - 重试管理：失败记录 upload_retry 递增，超阈值跳过
   - 服务端断开不崩溃：SIGPIPE 信号忽略 + MSG_NOSIGNAL
   - --test 模式支持完整 4 线程上传测试
+- sysvinit 服务化（阶段5）：
+  - init.d 脚本：start/stop/restart/status 四个 action
+  - PID 文件管理 (/var/run/water_gateway.pid)
+  - 日志输出：stdout + 文件双写 (log_file 配置项)
+  - 心跳日志：每 60s 输出采集/存储/上传统计
+  - 验证通过：SIGTERM 优雅退出 (80条零丢失)、开机自启、崩溃恢复、完整数据链路
 
 ## 目录结构
 
@@ -92,6 +98,9 @@
   docs/
     test-log.md
   driver/
+  system/
+    water-gateway.sh              (init.d 脚本)
+    install.sh                    (一键安装脚本)
   scripts/
     run_receiver.py              (TCP 上传测试接收端)
 
@@ -129,8 +138,10 @@ sudo yum install -y sqlite-devel
 ```sh
 cd app
 make clean && make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
-scp -O water_gateway root@192.168.2.201:/home/root/
-ssh root@192.168.2.201 "./water_gateway -c gateway.conf"
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    water_gateway root@192.168.2.201:/home/root/
+ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    root@192.168.2.201 "./water_gateway -c gateway.conf"
 ```
 
 ### 线程管道测试（无需硬件）
@@ -202,6 +213,45 @@ collect_thread       processor_thread        store_thread         upload_thread
 
 Include paths 需添加：`SYSTEM/usart3`、`HARDWARE/WQSENSOR`
 
+### 开发板部署
+
+开发板使用 sysvinit（非 systemd），通过 init.d 脚本管理服务：
+
+```sh
+# 1. 交叉编译 + 上传
+cd app
+make clean && make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    water_gateway root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../config/gateway.conf root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../system/water-gateway.sh root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../system/install.sh root@192.168.2.201:/home/root/
+
+# 2. 安装
+ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    root@192.168.2.201
+chmod +x install.sh && ./install.sh
+
+# 3. 使用
+/etc/init.d/water_gateway start
+/etc/init.d/water_gateway status
+/etc/init.d/water_gateway stop
+/etc/init.d/water_gateway restart
+```
+
+安装后路径：
+```text
+/usr/bin/water_gateway          可执行文件
+/etc/water_gateway.conf         配置文件
+/var/lib/water_gateway/         数据库和运行数据
+/var/run/water_gateway.pid      PID 文件
+/var/log/water_gateway.log      日志文件
+/etc/init.d/water_gateway       init.d 脚本
+```
+
 ## SQLite 数据库
 
 ### 表结构
@@ -257,6 +307,9 @@ upload_server_port=18800
 upload_period_ms=5000
 upload_batch_max=20
 upload_retry_max=3
+
+# log config
+log_file=stdout
 ```
 
 ## 硬件连接
@@ -283,7 +336,7 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   RX: 01 03 0E 02 D5 09 C9 01 31 03 39 00 00 00 00 01 31 30 C6
 ```
 
-## 当前代码状态 (2026-06-27)
+## 当前代码状态 (2026-06-28)
 
 ```
 已实现：
@@ -305,14 +358,16 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   ✅ upload 线程 - 4 线程完整管线 (collect → process → store → upload)
   ✅ 接收端测试脚本 (run_receiver.py) - 支持多轮重连、累计计数
   ✅ SIGPIPE 信号处理 - 服务端断开网关不崩溃
+  ✅ sysvinit init.d 脚本 - start/stop/restart/status (适配开发板 sysvinit)
+  ✅ 一键安装部署脚本 (install.sh)
+  ✅ 心跳日志 - 每 60s 输出采集/存储/上传统计
+  ✅ 文件日志支持 - log_file 配置项可选写文件
+  ✅ 开发板部署测试 - SIGTERM/自启/崩溃恢复/数据链路全部通过
 
 待实现：
-  ❌ systemd 服务化（阶段5）
   ❌ GPIO 告警驱动（阶段6）
 ```
 
 ## 下一步计划
 
-- 进入阶段5：systemd 服务化，开机自启，SIGTERM 优雅退出
 - 进入阶段6：GPIO 告警字符设备驱动
-- 可选：MQTT 上传后端（当前 TCP 架构预留了 upload_protocol 扩展点）

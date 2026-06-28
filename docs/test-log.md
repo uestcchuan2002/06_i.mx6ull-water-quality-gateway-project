@@ -1450,3 +1450,217 @@ collect_thread → raw_queue → processor_thread → store_queue → store_thre
 
 - 进入阶段5：systemd 服务化、开机自启、SIGTERM 优雅退出
 - 进入阶段6：GPIO 告警字符设备驱动
+
+---
+
+## 阶段5：sysvinit 服务化和日志完善 (2026-06-28)
+
+### 1. 当日目标
+
+完成阶段5前半部分——sysvinit init.d 脚本、安装部署、心跳日志增强：
+
+- 适配开发板 sysvinit（非 systemd）
+- 编写 `/etc/init.d/water_gateway` init.d 脚本
+- 编写 `install.sh` 一键部署脚本
+- 增强日志模块：支持 `log_file` 配置文件输出
+- 添加主循环心跳日志（每 60 秒输出运行统计）
+- 启动时打印 PID
+
+### 2. 新增和修改文件
+
+```text
+system/water-gateway.sh  (新增)  - init.d 脚本 (start/stop/restart/status)
+system/install.sh        (新增)  - 一键部署脚本
+app/include/config.h     (修改)  - 新增 log_file 字段
+app/src/config.c         (修改)  - 解析 log_file 配置项
+app/include/logger.h     (修改)  - 新增 logger_open_log_file / logger_close_log_file
+app/src/logger.c         (修改)  - 支持文件日志输出
+app/src/main.c           (修改)  - PID 打印 + 心跳日志
+config/gateway.conf      (修改)  - 新增 log_file 配置项
+```
+
+### 3. init.d 脚本 (system/water-gateway.sh)
+
+发现开发板使用 sysvinit (PID 1 = init, /sbin/init → /sbin/init.sysvinit)，无 systemd。
+
+改用 LSB init.d 脚本，实现四个 action：
+
+- **start**：后台启动 water_gateway，写 PID 到 `/var/run/water_gateway.pid`，输出重定向到 `/var/log/water_gateway.log`
+- **stop**：读 PID，发 SIGTERM，超时 10 秒后 `kill -9`
+- **restart**：stop + start
+- **status**：检查 PID 文件有效性
+
+### 4. 部署脚本 (system/install.sh)
+
+安装流程：
+
+1. 复制 `water_gateway` → `/usr/bin/`
+2. 复制 `gateway.conf` → `/etc/water_gateway.conf`
+3. 创建 `/var/lib/water_gateway/` 数据目录
+4. 复制 init.d 脚本 → `/etc/init.d/water_gateway`
+5. 调用 `update-rc.d` 或 `chkconfig` 注册开机自启
+6. 未找到注册工具时输出手动注册命令
+
+### 5. 日志模块增强
+
+新增 `logger_open_log_file()` 函数：
+- 参数为 `"stdout"`：保持 stdout 输出（默认）
+- 参数为文件路径：同时写 stdout 和文件（append 模式）
+- 新增 `log_file` 配置项到 `gateway.conf`
+
+### 6. 心跳日志
+
+生产模式主循环改为每秒检查一次 shutdown 标志，每 60 秒输出心跳：
+
+```text
+[2026-06-28 xx:xx:xx] [INFO] heartbeat: db_total=3600 db_unuploaded=0
+  store_written=3600 store_failed=0 uploaded=3600 upload_failed=0
+```
+
+### 7. 编译验证
+
+```sh
+cd app
+make clean && make LDFLAGS=
+```
+
+编译通过，零警告零错误。
+
+```sh
+./water_gateway -c ../config/gateway.conf --test 5
+```
+
+测试模式运行正常，新增 `log_file=stdout` 配置行出现在日志输出中。
+
+### 8. 开发板部署和功能测试
+
+#### 8.1 部署
+
+```sh
+# 交叉编译
+cd app
+make clean && make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+
+# 上传
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    water_gateway root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../config/gateway.conf root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../system/water-gateway.sh root@192.168.2.201:/home/root/
+scp -O -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    ../system/install.sh root@192.168.2.201:/home/root/
+
+# 安装
+ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa \
+    root@192.168.2.201
+chmod +x install.sh && ./install.sh
+```
+
+注意：init.d 脚本名 `water-gateway.sh`，安装后为 `/etc/init.d/water_gateway`，与 `/usr/bin/water_gateway` 区分。
+
+#### 8.2 init.d start / stop / restart / status 功能测试
+
+**启动：**
+
+```sh
+# /etc/init.d/water_gateway start
+Starting water_gateway: OK (pid 623)
+```
+
+**状态：**
+
+```sh
+# /etc/init.d/water_gateway status
+water_gateway is running (pid 623)
+```
+
+**进程验证（BusyBox ps 只显示关联终端进程，daemon 需用 `-e` 参数）：**
+
+```sh
+# ps -el | grep water_gateway
+0 S  0   623     1  0  80   0 -  9101 hrtime ?  00:00:00 water_gateway
+```
+
+- 父进程 PID = 1 (init)，符合 daemon 特征
+- TTY = ?，无控制终端
+
+#### 8.3 SIGTERM 优雅退出测试
+
+执行 `/etc/init.d/water_gateway stop`，日志输出：
+
+```text
+[2021-07-23 04:03:23] [INFO] shutting down...
+[2021-07-23 04:03:23] [INFO] processor thread stopped (processed 80 samples)
+[2021-07-23 04:03:23] [INFO] store thread stopped (processed 80 samples, written 80, failed 0)
+[2021-07-23 04:03:24] [INFO] collect thread stopped
+[2021-07-23 04:03:29] [INFO] uploader: draining remaining unuploaded records...
+[2021-07-23 04:03:29] [INFO] upload thread stopped (uploaded=80 failed=0)
+[2021-07-23 04:03:29] [INFO] === pipeline stopped ===
+[2021-07-23 04:03:29] [INFO] raw_queue:    pushed=80 overflow=0 remaining=0
+[2021-07-23 04:03:29] [INFO] store_queue:  pushed=80 overflow=0 remaining=0
+[2021-07-23 04:03:29] [INFO] store_thread:  written=80 failed=0
+[2021-07-23 04:03:29] [INFO] db:            total_samples=276 unuploaded=0
+[2021-07-23 04:03:29] [INFO] upload_thread: uploaded=80 failed=0
+[2021-07-23 04:03:29] [INFO] sqlite database closed
+```
+
+| 指标 | 值 |
+|---|---|
+| 采集次数 | 80 |
+| 写入成功 | 80 (100%) |
+| 写入失败 | 0 |
+| 上传成功 | 80 (100%) |
+| 上传失败 | 0 |
+| DB 总量 | 276 (含历史) |
+| DB 未上传 | 0 (全部补传) |
+| 队列溢出 | 0 |
+| 队列残留 | 0 |
+
+#### 8.4 崩溃恢复测试
+
+```sh
+# kill -9 623
+# /etc/init.d/water_gateway status
+water_gateway is not running
+
+# /etc/init.d/water_gateway start
+Starting water_gateway: OK (pid 680)
+```
+
+kill -9 后手动 start 正常拉起 4 线程管线，恢复采集和上传。
+
+#### 8.5 开机自启测试
+
+```sh
+# reboot
+# ps -el | grep water_gateway
+0 S  0   623     1  0  80   0 -  9101 hrtime ?  00:00:00 water_gateway
+```
+
+开发板重启后 water_gateway 自动运行（`update-rc.d water_gateway defaults` 注册成功）。
+
+#### 8.6 完整数据链路测试
+
+Ubuntu 端启动 TCP 接收端，开发板启动网关，接收端实时收到 JSON 数据，网络断开后数据不丢失，恢复后自动补传。
+
+### 9. 当日验收结论
+
+2026-06-28 阶段5 sysvinit 服务化和可靠性测试全部完成。
+
+已完成内容：
+
+- sysvinit init.d 脚本 (start/stop/restart/status) — 全部验证通过
+- 一键部署安装脚本 (install.sh)
+- logger 支持文件日志输出 (log_file 配置项)
+- 主循环心跳日志 (每 60 秒运行统计)
+- 启动时 PID 打印
+- SIGTERM 优雅退出：80 条采集零丢失，DB 全部排空
+- 开机自启：update-rc.d 注册成功，reboot 后自动运行
+- 崩溃恢复：kill -9 后手动 start 正常拉起
+- 完整数据链路：TCP 实时上传 + 断网补传 + 接收端验证通过
+- 版本号保持 0.4.0
+
+### 10. 下一步计划
+
+- 进入阶段6：GPIO 告警字符设备驱动

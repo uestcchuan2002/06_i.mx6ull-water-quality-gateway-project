@@ -2,10 +2,12 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 static log_level_t g_log_level = LOG_LEVEL_INFO;
+static FILE *g_log_file = NULL;
 
 static const char *logger_level_name(log_level_t level)
 {
@@ -68,12 +70,40 @@ void logger_set_level(log_level_t level)
     g_log_level = level;
 }
 
+void logger_open_log_file(const char *path)
+{
+    if (g_log_file != NULL && g_log_file != stdout) {
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+
+    if (path == NULL || path[0] == '\0' ||
+        strcmp(path, "stdout") == 0 || strcmp(path, "STDOUT") == 0) {
+        g_log_file = NULL;
+        return;
+    }
+
+    g_log_file = fopen(path, "a");
+    if (g_log_file == NULL) {
+        fprintf(stderr, "logger: failed to open log file: %s\n", path);
+    }
+}
+
+void logger_close_log_file(void)
+{
+    if (g_log_file != NULL && g_log_file != stdout) {
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+}
+
 void logger_log(log_level_t level, const char *fmt, ...)
 {
     time_t now;
     struct tm tm_now;
     char time_buf[32];
     va_list args;
+    va_list args_file;
 
     if (level < g_log_level) {
         return;
@@ -97,5 +127,16 @@ void logger_log(log_level_t level, const char *fmt, ...)
 
     fputc('\n', stdout);
     fflush(stdout);
+
+    if (g_log_file != NULL) {
+        fprintf(g_log_file, "[%s] [%s] ", time_buf, logger_level_name(level));
+
+        va_start(args_file, fmt);
+        vfprintf(g_log_file, fmt, args_file);
+        va_end(args_file);
+
+        fputc('\n', g_log_file);
+        fflush(g_log_file);
+    }
 }
 
