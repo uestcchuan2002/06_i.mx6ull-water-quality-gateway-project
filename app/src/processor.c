@@ -1,4 +1,5 @@
 #include "processor.h"
+#include "alarm_client.h"
 #include "logger.h"
 #include "config.h"
 
@@ -78,6 +79,8 @@ void *processor_thread(void *arg)
         ctx->sample_counter++;
 
         alarm = processor_compute_alarm(&sample, &ctx->thresholds);
+
+        alarm_client_set(ctx->alarm_fd, alarm ? 1 : 0);
 
         if (alarm) {
             sample.alarm_status |= alarm;

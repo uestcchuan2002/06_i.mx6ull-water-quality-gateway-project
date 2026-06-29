@@ -9,6 +9,7 @@
 #include <unistd.h>
 #endif
 
+#include "../include/alarm_client.h"
 #include "../include/config.h"
 #include "../include/logger.h"
 #include "../include/modbus_rtu.h"
@@ -208,6 +209,7 @@ static int run_test(int iterations)
     memset(&proc_ctx, 0, sizeof(proc_ctx));
     proc_ctx.raw_queue = raw_queue;
     proc_ctx.store_queue = store_queue;
+    proc_ctx.alarm_fd = -1;
     proc_ctx.shutdown = 0;
     processor_threshold_default(&proc_ctx.thresholds);
 
@@ -310,6 +312,7 @@ int main(int argc, char *argv[])
     int i;
     int test_iterations = 0;
     int fd = -1;
+    int alarm_fd = -1;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--config") == 0) {
@@ -381,6 +384,8 @@ int main(int argc, char *argv[])
         log_info("serial open success: %s", cfg.serial_device);
     }
 
+    alarm_fd = alarm_client_open("/dev/water_alarm");
+
     {
         sample_queue_t *raw_queue;
         sample_queue_t *store_queue;
@@ -400,6 +405,7 @@ int main(int argc, char *argv[])
         if (raw_queue == NULL || store_queue == NULL) {
             log_error("failed to create queues");
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -408,6 +414,7 @@ int main(int argc, char *argv[])
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -417,6 +424,7 @@ int main(int argc, char *argv[])
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -428,6 +436,7 @@ int main(int argc, char *argv[])
         memset(&proc_ctx, 0, sizeof(proc_ctx));
         proc_ctx.raw_queue = raw_queue;
         proc_ctx.store_queue = store_queue;
+        proc_ctx.alarm_fd = alarm_fd;
         proc_ctx.shutdown = 0;
         processor_threshold_default(&proc_ctx.thresholds);
 
@@ -446,6 +455,7 @@ int main(int argc, char *argv[])
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -458,6 +468,7 @@ int main(int argc, char *argv[])
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -473,6 +484,7 @@ int main(int argc, char *argv[])
             sample_queue_destroy(raw_queue);
             sample_queue_destroy(store_queue);
             if (fd >= 0) serial_close(fd);
+            alarm_client_close(alarm_fd);
             return 1;
         }
 
@@ -501,6 +513,7 @@ int main(int argc, char *argv[])
                 sample_queue_destroy(raw_queue);
                 sample_queue_destroy(store_queue);
                 if (fd >= 0) serial_close(fd);
+                alarm_client_close(alarm_fd);
                 return 1;
             }
         }
@@ -566,6 +579,8 @@ int main(int argc, char *argv[])
     if (fd >= 0) {
         serial_close(fd);
     }
+
+    alarm_client_close(alarm_fd);
 
     logger_close_log_file();
 

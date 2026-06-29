@@ -69,7 +69,7 @@ SSH 连接命令：
 ```sh
 ssh -oHostKeyAlgorithms=+ssh-rsa -oPubkeyAcceptedAlgorithms=+ssh-rsa root@192.168.2.201
 ```
-
+// 
 串口终端参数：
 
 ```text
@@ -1664,3 +1664,260 @@ Ubuntu 端启动 TCP 接收端，开发板启动网关，接收端实时收到 J
 ### 10. 下一步计划
 
 - 进入阶段6：GPIO 告警字符设备驱动
+
+---
+
+## 阶段6：GPIO 告警字符设备驱动 (2026-06-29)
+
+### 1. 当日目标
+- 配置驱动开发环境
+- 测试led的驱动程序，实现手动开关led
+- 修改设备树，关闭原有的led模拟心跳驱动
+
+### 2. 问题总结
+
+今天主要是在 **I.MX6ULL 开发板上移植并加载 `newchrled` 驱动**，过程中遇到的问题和解决方式可以这样总结：
+
+**1. insmod 报 Invalid module format**
+
+现象：
+
+```bash
+insmod: ERROR: could not insert module newchrled.ko: Invalid module format
+```
+
+原因是模块和板子当前运行内核版本不一致。
+
+板子：
+
+```bash
+uname -r
+4.1.15-g3dc0a4b
+```
+
+模块：
+
+```bash
+vermagic: 4.1.15 ...
+```
+
+解决方式：找到匹配源码：
+
+```text
+linux-imx-4.1.15-2.1.0-g3dc0a4b-v2.7.tar.bz2
+```
+
+用它重新编译驱动，并确保 `vermagic` 和当前内核一致。
+
+**2. 编译驱动时使用了错误编译器**
+
+一开始报：
+
+```bash
+cc1: error: code model kernel does not support PIC mode
+```
+
+原因是 Makefile 没指定 ARM 交叉编译器，默认用了 Ubuntu 本机 gcc。
+
+解决方式：在驱动 Makefile 中加入：
+
+```makefile
+ARCH := arm
+CROSS_COMPILE := arm-linux-gnueabihf-
+```
+
+并在编译模块时传入：
+
+```makefile
+$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
+```
+
+**3. 老内核遇到新 GCC 的 dtc 编译问题**
+
+编译内核时报：
+
+```bash
+multiple definition of `yylloc'
+```
+
+原因是 Linux 4.1.15 较老，新版 GCC 默认 `-fno-common`，导致内核自带 dtc 工具编译失败。
+
+解决方式：使用较老的 Linaro 工具链：
+
+```text
+gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf
+```
+
+或者临时用：
+
+```bash
+HOSTCFLAGS="-fcommon"
+```
+
+最终建议使用 64 位主机版本：
+
+```text
+gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf.tar.xz
+```
+
+**4. 内核源码缺少 .config**
+
+编译内核时报：
+
+```bash
+Configuration file ".config" not found!
+```
+
+解决方式：先生成配置：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- imx_v7_defconfig
+```
+
+然后再编译：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage -j4
+```
+
+**5. 缺少 lzop 工具**
+
+编译 `zImage` 时报：
+
+```bash
+/bin/sh: 1: lzop: not found
+```
+
+解决方式：
+
+```bash
+sudo apt install lzop
+```
+
+之后成功生成：
+
+```bash
+Kernel: arch/arm/boot/zImage is ready
+```
+
+**6. 模块版本号仍然不匹配**
+
+即使重新编译后，`modinfo` 仍显示：
+
+```bash
+vermagic: 4.1.15 ...
+```
+
+而板子是：
+
+```bash
+4.1.15-g3dc0a4b
+```
+
+解决方式：修改内核源码顶层 `Makefile` 中的：
+
+```makefile
+EXTRAVERSION = -g3dc0a4b
+```
+
+重新编译模块后，模块成功加载：
+
+```bash
+insmod newchrled.ko
+lsmod | grep newchrled
+newchrled 1971 0
+```
+
+**7. ledApp 运行时报 GLIBC 版本过高**
+
+现象：
+
+```bash
+./ledApp: /lib/libc.so.6: version `GLIBC_2.34' not found
+```
+
+原因是 `ledApp` 用较新的 Ubuntu 环境编译，依赖了开发板 rootfs 没有的新版 glibc。
+
+解决方式：用板子配套的旧版 ARM 交叉编译器重新编译应用，必要时静态编译：
+
+```bash
+arm-linux-gnueabihf-gcc -static ledApp.c -o ledApp
+```
+
+**8. LED 被设备树中的系统灯占用**
+
+最初 LED 被系统心跳灯干扰。后来确认 U-Boot 实际加载的设备树是：
+
+```bash
+fdt_file=imx6ull-14x14-emmc-7-1024x600-c.dtb
+```
+
+include 链是：
+
+```text
+imx6ull-14x14-emmc-7-1024x600-c.dts
+ -> imx6ull-14x14-evk-emmc.dts
+ -> imx6ull-14x14-evk.dts
+```
+
+最终在：
+
+```bash
+imx6ull-14x14-evk.dts
+```
+
+找到：
+
+```dts
+led1 {
+    label = "sys-led";
+    gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+    linux,default-trigger = "heartbeat";
+    default-state = "on";
+};
+```
+
+解决方式：取消心跳触发，并设置默认熄灭：
+
+```dts
+led1 {
+    label = "sys-led";
+    gpios = <&gpio1 3 GPIO_ACTIVE_LOW>;
+    linux,default-trigger = "none";
+    default-state = "off";
+};
+```
+
+重新编译设备树：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- dtbs -j4
+```
+
+替换板子启动分区中的：
+
+```bash
+/run/media/mmcblk1p1/imx6ull-14x14-emmc-7-1024x600-c.dtb
+```
+
+执行：
+
+```bash
+sync
+reboot
+```
+
+最终 LED 默认熄灭，且不再被 heartbeat 干扰。
+
+**最终结论**
+
+这次移植主要解决了四类问题：
+
+```text
+内核版本匹配问题
+交叉编译工具链问题
+老内核与新 GCC 兼容问题
+设备树 LED 节点冲突问题
+```
+
+最终驱动模块能够正常加载，设备树也成功修改，系统 LED 从 heartbeat 改为默认关闭。

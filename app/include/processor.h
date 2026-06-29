@@ -22,6 +22,7 @@ typedef struct {
     sample_queue_t *raw_queue;
     sample_queue_t *store_queue;
     processor_threshold_t thresholds;
+    int alarm_fd;
     int sample_counter;
     volatile int shutdown;
 } processor_ctx_t;
