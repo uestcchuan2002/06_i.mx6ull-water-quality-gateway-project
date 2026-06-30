@@ -20,6 +20,7 @@ typedef struct {
     int max_cache_count;
     int upload_enabled;
     char upload_protocol[16];
+    char alarm_device[128];
     char log_file[256];
     char upload_server_host[128];
     int upload_server_port;

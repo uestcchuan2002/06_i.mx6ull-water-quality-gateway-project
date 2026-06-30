@@ -365,6 +365,7 @@ int main(int argc, char *argv[])
     log_info("upload_period_ms=%d batch=%d retry=%d",
              cfg.upload_period_ms, cfg.upload_batch_max, cfg.upload_retry_max);
     log_info("log_file=%s", cfg.log_file);
+    log_info("alarm_device=%s", cfg.alarm_device);
 
     if (test_iterations > 0) {
         return run_test(test_iterations);
@@ -384,7 +385,7 @@ int main(int argc, char *argv[])
         log_info("serial open success: %s", cfg.serial_device);
     }
 
-    alarm_fd = alarm_client_open("/dev/water_alarm");
+    alarm_fd = alarm_client_open(cfg.alarm_device);
 
     {
         sample_queue_t *raw_queue;

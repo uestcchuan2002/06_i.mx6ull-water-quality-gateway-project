@@ -60,6 +60,7 @@ void config_set_default(gateway_config_t *cfg)
     cfg->upload_enabled = 1;
     copy_string(cfg->upload_protocol, sizeof(cfg->upload_protocol), "tcp");
     copy_string(cfg->log_file, sizeof(cfg->log_file), "stdout");
+    copy_string(cfg->alarm_device, sizeof(cfg->alarm_device), "/dev/newchrled");
     copy_string(cfg->upload_server_host, sizeof(cfg->upload_server_host), "192.168.2.150");
     cfg->upload_server_port = 18800;
     cfg->upload_period_ms = 5000;
@@ -142,6 +143,8 @@ int config_load(const char *path, gateway_config_t *cfg)
             cfg->upload_retry_max = atoi(value);
         } else if (strcmp(key, "log_file") == 0) {
             copy_string(cfg->log_file, sizeof(cfg->log_file), value);
+        } else if (strcmp(key, "alarm_device") == 0) {
+            copy_string(cfg->alarm_device, sizeof(cfg->alarm_device), value);
         } else {
             fprintf(stderr, "unknown config key at line %d: %s\n", line_no, key);
         }
@@ -194,6 +197,7 @@ void config_print(const gateway_config_t *cfg)
     printf("  upload_batch_max   = %d\n", cfg->upload_batch_max);
     printf("  upload_retry_max   = %d\n", cfg->upload_retry_max);
     printf("  log_file           = %s\n", cfg->log_file);
+    printf("  alarm_device       = %s\n", cfg->alarm_device);
 }
 
 

@@ -12,6 +12,9 @@
 #define ALARM_COND_HIGH   (1u << 3)
 #define ALARM_TEMP_HIGH   (1u << 4)
 
+#define DEBOUNCE_ON_COUNT  3
+#define DEBOUNCE_OFF_COUNT 2
+
 void processor_threshold_default(processor_threshold_t *th)
 {
     if (th == NULL) {
@@ -59,6 +62,9 @@ unsigned int processor_compute_alarm(const water_sample_t *sample,
 void *processor_thread(void *arg)
 {
     processor_ctx_t *ctx = (processor_ctx_t *)arg;
+    int led_on = 0;
+    int alarm_cnt = 0;
+    int clear_cnt = 0;
 
     if (ctx == NULL || ctx->raw_queue == NULL) {
         return NULL;
@@ -80,7 +86,25 @@ void *processor_thread(void *arg)
 
         alarm = processor_compute_alarm(&sample, &ctx->thresholds);
 
-        alarm_client_set(ctx->alarm_fd, alarm ? 1 : 0);
+        if (alarm) {
+            alarm_cnt++;
+            clear_cnt = 0;
+            if (!led_on && alarm_cnt >= DEBOUNCE_ON_COUNT) {
+                alarm_client_set(ctx->alarm_fd, 1);
+                led_on = 1;
+                log_info("alarm: LED ON (debounced %d samples)",
+                         DEBOUNCE_ON_COUNT);
+            }
+        } else {
+            clear_cnt++;
+            alarm_cnt = 0;
+            if (led_on && clear_cnt >= DEBOUNCE_OFF_COUNT) {
+                alarm_client_set(ctx->alarm_fd, 0);
+                led_on = 0;
+                log_info("alarm: LED OFF (debounced %d samples)",
+                         DEBOUNCE_OFF_COUNT);
+            }
+        }
 
         if (alarm) {
             sample.alarm_status |= alarm;

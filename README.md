@@ -15,7 +15,8 @@
 - 2026-06-27：完成阶段3前半部分——多线程数据管线架构 (pthread) 和告警处理模块
 - 2026-06-27：完成阶段3后半部分——SQLite 存储模块和存储线程 (3线程完整管线)
 - 2026-06-28：完成阶段5——sysvinit init.d 脚本、部署安装、开发板全功能验证 (start/stop/restart/status/SIGTERM/自启/崩溃恢复)
-- 2026-06-28：完成阶段6——GPIO 告警字符设备驱动 (water_alarm.ko)、告警客户端、主程序联动 (待开发板加载测试)
+- 2026-06-28：完成阶段6前半——GPIO 告警字符设备驱动 (newchrled) 编译进内核
+- 2026-06-30：完成阶段6后半——告警客户端重构 (对接字符设备驱动)、防抖逻辑、告警联动完整闭环
 
 ## 当前 Demo 功能
 
@@ -67,9 +68,11 @@
   - 心跳日志：每 60s 输出采集/存储/上传统计
   - 验证通过：SIGTERM 优雅退出 (80条零丢失)、开机自启、崩溃恢复、完整数据链路
 - GPIO 告警驱动（阶段6）：
-  - `water_alarm` 字符设备驱动：module_init/exit, file_operations, GPIO 控制 (GPIO0)
-  - 设备节点自动创建：`/dev/water_alarm` (class_create + device_create)
-  - 蜂鸣器联动：processor 告警 → alarm_client → 驱动 GPIO (低电平触发蜂鸣器)
+  - `newchrled` 字符设备驱动：控制 GPIO1_IO03 板载 LED，编译进内核，开机自动加载
+  - 设备节点：`/dev/newchrled` (自动创建)
+  - 告警客户端 (alarm_client.c)：通过 open/write/close 操作字符设备，替代 sysfs GPIO
+  - 防抖机制：连续 3 次超限才亮灯，连续 2 次正常才灭灯，避免边界抖动
+  - 可配置设备路径：`alarm_device=/dev/newchrled` (gateway.conf)
   - 空洞容错：驱动未加载时告警功能自动禁用，不影响主程序
 
 ## 目录结构
@@ -323,6 +326,7 @@ upload_retry_max=3
 
 # log config
 log_file=stdout
+alarm_device=/dev/newchrled
 ```
 
 ## 硬件连接
@@ -349,7 +353,7 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   RX: 01 03 0E 02 D5 09 C9 01 31 03 39 00 00 00 00 01 31 30 C6
 ```
 
-## 当前代码状态 (2026-06-28)
+## 当前代码状态 (2026-06-30)
 
 ```
 已实现：
@@ -376,17 +380,21 @@ i.MX6ULL /dev/ttymxc2 (UART3)          STM32F407 USART3
   ✅ 心跳日志 - 每 60s 输出采集/存储/上传统计
   ✅ 文件日志支持 - log_file 配置项可选写文件
   ✅ 开发板部署测试 - SIGTERM/自启/崩溃恢复/数据链路全部通过
-  ✅ GPIO 告警字符设备驱动 (water_alarm.ko) - GPIO0 控制
-  ✅ 告警客户端模块 (alarm_client.c) - /dev/water_alarm 操作封装
-  ✅ 主程序告警联动 - processor 告警 → GPIO 蜂鸣器输出
+  ✅ GPIO 告警字符设备驱动 (newchrled) - 编译进内核，GPIO1_IO03 控制板载 LED
+  ✅ 告警客户端模块 (alarm_client.c) - 字符设备 open/write/close 接口
+  ✅ 告警防抖机制 - 连续 3 次超限亮灯 / 连续 2 次正常灭灯
+  ✅ 可配置告警设备路径 - alarm_device=/dev/newchrled (gateway.conf)
+  ✅ 主程序告警联动 - processor 阈值判断 → alarm_client → /dev/newchrled → LED
 
-待实现：
-  ❌ 开发板驱动加载和 GPIO 控制测试 (阶段6后半)
-  ❌ 项目包装、简历和面试材料 (阶段7)
 ```
 
-## 下一步计划
+## 告警参数
 
-- 在开发板上编译加载驱动，验证 GPIO 控制 (echo 0/1 测试)
-- 主程序联动告警阈值触发测试 (蜂鸣器实际响应)
-- 进入阶段7：项目包装、简历和面试材料
+| 参数 | 告警条件 | 阈值 |
+|------|---------|------|
+| pH | < 6.5 或 > 8.5 | 6.5 ~ 8.5 |
+| 温度 | > 45.0 °C | ≤ 45.0 °C |
+| 浊度 | > 5.0 NTU | ≤ 5.0 NTU |
+| 电导率 | > 2000.0 μS/cm | ≤ 2000.0 μS/cm |
+
+告警链路：`processor 阈值判断 → 防抖(3 ON / 2 OFF) → alarm_client → write(1/0) → /dev/newchrled → GPIO1_IO03 → LED 亮/灭`

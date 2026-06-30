@@ -2271,3 +2271,168 @@ imx6ull-14x14-emmc-7-1024x600-c.dtb
 
 开发板重启后无需手动 `insmod`，驱动会随内核自动加载。
 
+---
+
+## 阶段6 完善：告警客户端重构与联动闭环 (2026-06-30)
+
+### 1. 问题诊断
+
+告警客户端 (`alarm_client.c`) 此前使用 **sysfs GPIO 接口** (`/sys/class/gpio/gpio0/value`) 控制蜂鸣器，与项目实际的 `newchrled` 字符设备驱动脱节：
+
+- `main.c` 调用 `alarm_client_open("/dev/water_alarm")`，但设备节点实际为 `/dev/newchrled`
+- `alarm_client.c` 内部忽略传入的 device 参数，硬编码走 GPIO0 的 sysfs export/unexport
+- 告警功能和 LED 驱动实际未联动
+
+### 2. 修改方案
+
+#### 2.1 重写 alarm_client.c
+
+参照 `ledApp.c` 的使用模式，将 sysfs GPIO 操作替换为字符设备 open/write/close：
+
+**修改前** (sysfs GPIO):
+
+```c
+// 打开 sysfs export 导出 GPIO0
+fd_export = open("/sys/class/gpio/export", O_WRONLY);
+write(fd_export, "0", 1);
+// 设置方向
+fd_direction = open("/sys/class/gpio/gpio0/direction", O_WRONLY);
+write(fd_direction, "out", 3);
+// 控制电平
+fd_value = open("/sys/class/gpio/gpio0/value", O_RDWR);
+```
+
+**修改后** (字符设备驱动):
+
+```c
+int alarm_client_open(const char *device)
+{
+    int fd = open(device, O_RDWR);  // 直接打开 /dev/newchrled
+    if (fd < 0) {
+        log_warn("alarm: open %s failed, hardware alarm disabled");
+        return -1;
+    }
+    return fd;
+}
+
+void alarm_client_set(int fd, int on)
+{
+    unsigned char cmd = on ? 1 : 0;  // 1=LED ON, 0=LED OFF
+    write(fd, &cmd, 1);
+}
+
+void alarm_client_close(int fd)
+{
+    if (fd >= 0) close(fd);  // 仅关闭 fd，无需 sysfs 清理
+}
+```
+
+#### 2.2 添加 alarm_device 配置项
+
+在 `config.h` 中新增字段：
+
+```c
+char alarm_device[128];
+```
+
+默认值：`/dev/newchrled`，支持通过 `gateway.conf` 配置：
+
+```ini
+alarm_device=/dev/newchrled
+```
+
+`main.c` 改为从配置读取：
+
+```c
+alarm_fd = alarm_client_open(cfg.alarm_device);
+```
+
+#### 2.3 告警防抖机制
+
+`processor.c` 中新增防抖计数器，防止参数在阈值边界抖动时 LED 快速闪烁：
+
+- **触发亮灯**：连续 3 次采样均超限 → `alarm_client_set(1)` → LED ON
+- **停止灭灯**：连续 2 次采样均正常 → `alarm_client_set(0)` → LED OFF
+
+```c
+#define DEBOUNCE_ON_COUNT  3
+#define DEBOUNCE_OFF_COUNT 2
+
+if (alarm) {
+    alarm_cnt++;
+    clear_cnt = 0;
+    if (!led_on && alarm_cnt >= DEBOUNCE_ON_COUNT) {
+        alarm_client_set(ctx->alarm_fd, 1);
+        led_on = 1;
+    }
+} else {
+    clear_cnt++;
+    alarm_cnt = 0;
+    if (led_on && clear_cnt >= DEBOUNCE_OFF_COUNT) {
+        alarm_client_set(ctx->alarm_fd, 0);
+        led_on = 0;
+    }
+}
+```
+
+### 3. 变更文件
+
+| 文件 | 变更 |
+|------|------|
+| `app/src/alarm_client.c` | 重写：sysfs GPIO → 字符设备 open/write/close |
+| `app/src/main.c` | 设备路径从配置读取 (`cfg.alarm_device`) |
+| `app/include/config.h` | 新增 `char alarm_device[128]` |
+| `app/src/config.c` | 默认值 `/dev/newchrled` + 解析 alarm_device |
+| `config/gateway.conf` | 新增 `alarm_device=/dev/newchrled` |
+| `app/src/processor.c` | 新增防抖逻辑 (3 ON / 2 OFF) |
+
+### 4. 编译验证
+
+```bash
+cd app
+make clean && make
+```
+
+编译结果：零错误、零警告。
+
+```bash
+./water_gateway -c ../config/gateway.conf --test 15
+```
+
+测试结果：
+
+```text
+[INFO] alarm_device=/dev/newchrled
+[INFO] processor thread started
+[INFO] [proc] #1 ... alarm_status=0x0 ...
+...
+[INFO] processor thread stopped (processed 30 samples)
+[INFO] store thread stopped (processed 30 samples, written 30, failed 0)
+[INFO] === test complete ===
+[INFO] db: total_samples=30 unuploaded=30
+```
+
+Mock 数据在阈值范围内（pH 7.x, temp 25.x 等），无告警触发，管线正常运行。
+
+### 5. 告警链路
+
+```
+processor 阈值判断
+    → 防抖计数器 (3次确认亮灯 / 2次确认灭灯)
+    → alarm_client_set(1/0)
+    → write(0x01/0x00) 写入 /dev/newchrled
+    → 驱动 led_write() → led_switch()
+    → GPIO1_IO03 电平输出
+    → 板载 LED 亮/灭
+```
+
+### 6. 注意事项
+
+1. 驱动未加载时 (`/dev/newchrled` 不存在) → `alarm_client_open` 返回 -1，后续 `alarm_client_set` 检查 fd < 0 直接 return，主程序不受影响
+2. 交叉编译部署使用原有命令：
+   ```bash
+   make CROSS_COMPILE=arm-linux-gnueabihf- LDFLAGS=-static
+   scp water_gateway root@192.168.2.201:/home/root/
+   ```
+3. 开发板测试时可通过反复修改 mock 数据的阈值范围来验证 LED 正常亮灭
+
