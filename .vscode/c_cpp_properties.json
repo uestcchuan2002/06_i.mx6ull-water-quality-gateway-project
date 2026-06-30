@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "name": "Linux",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "/home/wangchuan/mcode/linux_kernel/include", 
+                "/home/wangchuan/mcode/linux_kernel/arch/arm/include"
+
+            ],
+            "defines": []
+           
+        }
+    ],
+    "version": 4
+}

@@ -1921,3 +1921,353 @@ reboot
 ```
 
 最终驱动模块能够正常加载，设备树也成功修改，系统 LED 从 heartbeat 改为默认关闭。
+
+---
+
+## 将驱动程序编译至内核 （6月30日）
+
+
+#### 1. 目标
+
+将外部驱动 `newchrled.c` 从 `.ko` 模块形式，改为直接编译进 Linux 内核。
+
+编译进内核后，系统启动时驱动会自动初始化，不再需要手动执行：
+
+```bash
+insmod newchrled.ko
+```
+
+#### 2. 准备交叉编译环境
+
+Linux 4.1.15 属于较老内核，建议使用老版本 Linaro GCC。
+
+本次使用：
+
+```bash
+gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf
+```
+
+配置环境变量：
+
+```bash
+export PATH=/home/wangchuan/mcode/tools/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin:$PATH
+```
+
+确认是否切换成功：
+
+```bash
+arm-linux-gnueabihf-gcc -v
+```
+
+看到类似：
+
+```bash
+gcc 版本 4.9.4 (Linaro GCC 4.9-2017.01)
+```
+
+说明成功。
+
+---
+
+#### 3. 将驱动源码放入内核目录
+
+进入内核源码目录：
+
+```bash
+cd /home/wangchuan/mcode/linux_kernel
+```
+
+创建驱动目录：
+
+```bash
+mkdir -p drivers/char/newchrled
+```
+
+复制驱动源码：
+
+```bash
+cp /home/wangchuan/mcode/03_newchrled/newchrled.c drivers/char/newchrled/
+```
+
+---
+
+#### 4. 添加驱动目录 Makefile
+
+新建文件：
+
+```bash
+vi drivers/char/newchrled/Makefile
+```
+
+内容：
+
+```makefile
+obj-$(CONFIG_NEWCHRLED) += newchrled.o
+```
+
+含义：
+
+```text
+当 CONFIG_NEWCHRLED=y 时，将 newchrled.o 编进内核。
+```
+
+---
+
+#### 5. 添加驱动 Kconfig
+
+新建文件：
+
+```bash
+vi drivers/char/newchrled/Kconfig
+```
+
+内容：
+
+```kconfig
+menu "New character LED driver"
+
+config NEWCHRLED
+    bool "New character LED driver"
+    default y
+    help
+      This is a simple character LED driver for i.MX6ULL.
+
+endmenu
+```
+
+说明：
+
+```text
+bool 表示只能编进内核或不编译。
+default y 表示默认启用。
+```
+
+如果想支持编译成模块，可以把 `bool` 改成 `tristate`。
+
+---
+
+#### 6. 修改上级 Kconfig
+
+编辑：
+
+```bash
+vi drivers/char/Kconfig
+```
+
+在合适位置或末尾添加：
+
+```kconfig
+source "drivers/char/newchrled/Kconfig"
+```
+
+作用：让内核配置系统能看到 `NEWCHRLED` 选项。
+
+---
+
+#### 7. 修改上级 Makefile
+
+编辑：
+
+```bash
+vi drivers/char/Makefile
+```
+
+添加：
+
+```makefile
+obj-$(CONFIG_NEWCHRLED) += newchrled/
+```
+
+作用：让内核编译系统进入 `drivers/char/newchrled/` 目录编译驱动。
+
+---
+
+#### 8. 编译内核
+
+进入内核源码目录：
+
+```bash
+cd /home/wangchuan/mcode/linux_kernel
+```
+
+编译：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage -j4
+```
+
+如果出现新配置询问：
+
+```text
+New character LED driver (NEWCHRLED) [Y/n/?] (NEW)
+```
+
+输入：
+
+```text
+Y
+```
+
+然后回车。
+
+编译成功后会看到：
+
+```bash
+Kernel: arch/arm/boot/zImage is ready
+```
+
+生成的新内核镜像位置：
+
+```bash
+/home/wangchuan/mcode/linux_kernel/arch/arm/boot/zImage
+```
+
+---
+
+#### 9. 备份开发板原 zImage
+
+在开发板上执行：
+
+```bash
+cd /run/media/mmcblk1p1
+cp zImage zImage.bak
+sync
+```
+
+确认备份：
+
+```bash
+ls -l zImage zImage.bak
+```
+
+---
+
+#### 10. 替换开发板 zImage
+
+在 Ubuntu 上执行：
+
+```bash
+scp -O -o HostKeyAlgorithms=+ssh-rsa \
+/home/wangchuan/mcode/linux_kernel/arch/arm/boot/zImage \
+root@192.168.2.201:/run/media/mmcblk1p1/
+```
+
+如果开发板 IP 不同，需要替换 `192.168.2.201`。
+
+开发板上执行：
+
+```bash
+sync
+reboot
+```
+
+---
+
+#### 11. 重启后验证
+
+因为驱动已经编进内核，所以不需要：
+
+```bash
+insmod newchrled.ko
+```
+
+可以查看设备号：
+
+```bash
+cat /proc/devices | grep newchrled
+```
+
+查看内核日志：
+
+```bash
+dmesg | grep -i newchrled
+```
+
+如果驱动没有自动创建设备节点，需要手动创建：
+
+```bash
+major=$(cat /proc/devices | awk '$2=="newchrled"{print $1}')
+mknod /dev/newchrled c $major 0
+```
+
+测试：
+
+```bash
+./ledApp /dev/newchrled 1
+./ledApp /dev/newchrled 0
+```
+
+---
+
+#### 12. 注意事项
+
+##### 1. 编进内核后不能再 rmmod
+
+模块方式：
+
+```bash
+insmod newchrled.ko
+rmmod newchrled
+```
+
+编进内核后驱动随内核启动，不能卸载。
+
+##### 2. module_init 仍然可用
+
+驱动里原来的：
+
+```c
+module_init(led_init);
+module_exit(led_exit);
+```
+
+可以保留。
+
+编进内核时，`module_init()` 会在内核启动阶段调用。
+
+但 `module_exit()` 基本不会执行，因为内建驱动不能卸载。
+
+##### 3. 修改驱动后必须重新编译 zImage
+
+如果修改了：
+
+```bash
+drivers/char/newchrled/newchrled.c
+```
+
+需要重新执行：
+
+```bash
+make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- zImage -j4
+```
+
+并重新替换开发板里的 `zImage`。
+
+##### 4. 设备树和 zImage 是两个文件
+
+驱动编进内核主要替换：
+
+```bash
+zImage
+```
+
+如果设备树也修改了，还需要重新编译并替换对应 `.dtb`。
+
+当前开发板 U-Boot 使用的设备树是：
+
+```bash
+imx6ull-14x14-emmc-7-1024x600-c.dtb
+```
+
+对应启动分区：
+
+```bash
+/run/media/mmcblk1p1/
+```
+
+#### 13. 本次最终结果
+
+驱动 `newchrled` 已成功编译进内核。
+
+开发板重启后无需手动 `insmod`，驱动会随内核自动加载。
+
